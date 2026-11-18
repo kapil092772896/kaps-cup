@@ -26,3 +26,33 @@ The goal of Kaps-Cup is simple: make AI accessible to everyone by providing a un
 
 ### License
 Open-source project. License details will be added.
+
+
+## 👨‍💻 Author & Project Creator
+
+### Kapil Sharma
+**Senior Software Engineer | 10+ Years of Software Development Experience**
+
+📧 **Email:** [v.kapil1988@gmail.com](mailto:v.kapil1988@gmail.com)
+
+**Creator & Lead Developer of Kaps-Cup – Claude Universal Proxy**
+
+With over 10 years of experience in software development, I am passionate about designing and building practical, scalable, and innovative technology solutions.
+
+Kaps-Cup is an initiative to make AI technology more accessible by helping developers and users connect different Large Language Models (LLMs) through a unified proxy solution powered by LiteLLM.
+
+**Technical Expertise & Focus Areas**
+- Software Architecture & System Design
+- Backend Development & API Engineering
+- AI Integration & Large Language Models (LLMs)
+- Java, Python & Modern Application Development
+- API Integration & Proxy Architecture
+- Open-Source Software Development
+
+**My Vision**
+
+Making AI accessible to everyone by building open-source tools that simplify technology, reduce costs, and empower developers to innovate without limitations.
+
+---
+
+*Built with passion by Kapil Sharma | Kaps-Cup – One Proxy. Multiple Models. More AI Freedom.*
