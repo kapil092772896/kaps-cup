@@ -384,16 +384,29 @@ function diagnoseBug({ statusCode, rawMessage, provider, model, stats }) {
   }
 
   // 3. Payload / Context / Size / 32MB limit issues
-  if (statusCode === 413 || msgLower.includes("32mb") || msgLower.includes("too large") || msgLower.includes("context length") || msgLower.includes("max_tokens") || msgLower.includes("payload")) {
-    return {
-      title: "Payload / Context Size Limit Bug",
-      rawError: rawMessage,
-      cause: `Request ka size ~${stats.payloadMB} MB hai (Messages: ${stats.msgCount}, Images: ${stats.images}, Base64: ${stats.base64MB} MB). Input ya image/context size model/gateway limit se zyada ja raha hai.`,
-      solution:
-        "1. Naya session shuru karein ya /clear chalayein taaki purani context/attachments hat jayein.\n" +
-        "2. Badi images/screenshots compress karein ya poore file paste karne ke bajay sirf relevant lines/file path dein."
-    };
-  }
+  // diagnoseBug ke andar "3. Payload / Context / Size / 32MB limit issues" wale block ko isse replace karein:
+if (
+  statusCode === 413 ||
+  msgLower.includes("tokens per minute") ||
+  msgLower.includes("tpm") ||
+  msgLower.includes("32mb") ||
+  msgLower.includes("too large") ||
+  msgLower.includes("context length") ||
+  msgLower.includes("max_tokens") ||
+  msgLower.includes("payload")
+) {
+  const isTpmError = msgLower.includes("tokens per minute") || msgLower.includes("tpm");
+  return {
+    title: isTpmError ? "Groq / Provider TPM Token Limit Bug" : "Payload / Context Size Limit Bug",
+    rawError: rawMessage,
+    cause: isTpmError
+      ? `Payload size sirf ${stats.payloadMB} MB hai, lekin Claude Code ke system prompt + tools ki wajah se request mein ~34k+ tokens ban rahe hain, jo ${provider} (${model}) ke TPM limit se zyada hain.`
+      : `Request ka size ~${stats.payloadMB} MB hai (Messages: ${stats.msgCount}, Images: ${stats.images}, Base64: ${stats.base64MB} MB). Input ya image/context size limit se zyada ja raha hai.`,
+    solution: isTpmError
+      ? "1. Model badlein (X-Target-Model mein zyada TPM/context wala model set karein) ya Groq billing/tier check karein.\n2. Claude Code mein heavy MCP servers/tools kam karein ya OpenRouter/Gemini/OpenAI provider try karein."
+      : "1. Naya session shuru karein ya /clear chalayein taaki purani context/attachments hat jayein.\n2. Badi images/screenshots compress karein ya poore file paste karne ke bajay sirf relevant lines/file path dein."
+  };
+}
 
   // 4. Rate limit / Quota
   if (statusCode === 429 || msgLower.includes("rate limit") || msgLower.includes("quota") || msgLower.includes("too many requests")) {
