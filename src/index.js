@@ -29,7 +29,7 @@ export default {
       return new Response(
         JSON.stringify({
           status: "running",
-          project: "kaps-cup smart auto-slimming AI proxy",
+          project: "kaps-cup smart auto-slimming AI proxy v2",
           usage: "Set X-Target-Model header in settings.json to use ANY model"
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
@@ -44,11 +44,13 @@ export default {
       let reqModel = "claude-sonnet-4-5";
       let finalModel = "unknown";
       let targetUrl = "unknown";
+      let tokenInfo = { rawEstTokens: 0, sentEstTokens: 0, trimmed: false };
 
       try {
         rawBodyText = await request.text();
         const payloadBytes = new TextEncoder().encode(rawBodyText).length;
         const payloadMB = (payloadBytes / (1024 * 1024)).toFixed(2);
+        tokenInfo.rawEstTokens = Math.ceil(rawBodyText.length / 4);
 
         try {
           anthropicReq = JSON.parse(rawBodyText);
@@ -61,6 +63,7 @@ export default {
             provider: "Client / Proxy",
             model: "N/A",
             payloadMB,
+            tokenInfo,
             rawError: parseErr.message,
             cause: "Client se bheja gaya request JSON valid nahi hai.",
             solution: "Ek naya session/prompt try karein."
@@ -86,6 +89,7 @@ export default {
             provider: "Auth Check",
             model: selectedModel || reqModel,
             payloadMB: stats.payloadMB,
+            tokenInfo,
             rawError: "No x-api-key or Authorization header received.",
             cause: "Claude Code se proxy ko API key nahi mil rahi hai.",
             solution: "settings.json ya env mein ANTHROPIC_API_KEY set karein aur terminal restart karein."
@@ -195,11 +199,14 @@ export default {
           finalModel = selectedModel || "openrouter/free";
         }
 
-        // Hard Token Budget Enforcement for Groq (7000 ITPM limit -> target <= 5000 tokens)
+        // Hard Token Budget Enforcement for Groq (7000 ITPM limit -> target <= 4500 tokens)
         if (providerName === "Groq") {
-          const slimmed = enforceTokenBudget(openAiMessages, openAiTools, 18000); // ~4500-5000 tokens max
+          const slimmed = enforceTokenBudget(openAiMessages, openAiTools, 14000);
           openAiMessages = slimmed.messages;
           openAiTools = slimmed.tools;
+          tokenInfo.trimmed = true;
+        } else {
+          openAiMessages = ensureUserMessage(openAiMessages);
         }
 
         const providerPayload = {
@@ -214,20 +221,25 @@ export default {
           providerPayload.tools = openAiTools;
         }
 
+        const finalPayloadStr = JSON.stringify(providerPayload);
+        tokenInfo.sentEstTokens = Math.ceil(finalPayloadStr.length / 4);
+
         let aiRes = await fetch(targetUrl, {
           method: "POST",
           headers,
-          body: JSON.stringify(providerPayload)
+          body: finalPayloadStr
         });
 
         // Auto-retry without tools if Groq still hits 413 TPM limit
         if (aiRes.status === 413 && providerName === "Groq" && providerPayload.tools) {
           delete providerPayload.tools;
-          providerPayload.messages = enforceTokenBudget(openAiMessages, [], 12000).messages;
+          providerPayload.messages = enforceTokenBudget(openAiMessages, [], 10000).messages;
+          const retryStr = JSON.stringify(providerPayload);
+          tokenInfo.sentEstTokens = Math.ceil(retryStr.length / 4);
           aiRes = await fetch(targetUrl, {
             method: "POST",
             headers,
-            body: JSON.stringify(providerPayload)
+            body: retryStr
           });
         }
 
@@ -241,7 +253,8 @@ export default {
             rawMessage: `Non-JSON response: ${rawText.slice(0, 400)}`,
             provider: providerName,
             model: finalModel,
-            stats
+            stats,
+            tokenInfo
           });
           return formatChatDiagnostic({
             stream: wantsStream,
@@ -250,6 +263,7 @@ export default {
             provider: providerName,
             model: finalModel,
             payloadMB: stats.payloadMB,
+            tokenInfo,
             ...diag
           });
         }
@@ -265,7 +279,8 @@ export default {
             rawMessage: upstreamErrMsg,
             provider: providerName,
             model: finalModel,
-            stats
+            stats,
+            tokenInfo
           });
 
           return formatChatDiagnostic({
@@ -275,6 +290,7 @@ export default {
             provider: providerName,
             model: finalModel,
             payloadMB: stats.payloadMB,
+            tokenInfo,
             ...diag
           });
         }
@@ -282,9 +298,13 @@ export default {
         // Convert Response back to Anthropic Format
         const choice = aiData.choices?.[0]?.message || {};
         const contentBlocks = [];
+        const promptTokens = aiData.usage?.prompt_tokens ?? tokenInfo.sentEstTokens;
+        const completionTokens = aiData.usage?.completion_tokens ?? 0;
+        const totalTokens = aiData.usage?.total_tokens ?? promptTokens + completionTokens;
 
         if (choice.content) {
-          contentBlocks.push({ type: "text", text: choice.content });
+          const usageBadge = `\n\n---\n> **Proxy Token Stats** | Model: \`${finalModel}\` (${providerName}) | Raw Est: \`~${tokenInfo.rawEstTokens}\` → Sent: \`${promptTokens}\` in + \`${completionTokens}\` out = **\`${totalTokens}\` tokens**`;
+          contentBlocks.push({ type: "text", text: choice.content + usageBadge });
         }
 
         if (choice.tool_calls) {
@@ -310,8 +330,8 @@ export default {
           content: contentBlocks.length > 0 ? contentBlocks : [{ type: "text", text: "" }],
           stop_reason: choice.tool_calls?.length > 0 ? "tool_use" : "end_turn",
           usage: {
-            input_tokens: aiData.usage?.prompt_tokens || 10,
-            output_tokens: aiData.usage?.completion_tokens || 10
+            input_tokens: promptTokens,
+            output_tokens: completionTokens || 10
           }
         };
 
@@ -330,7 +350,8 @@ export default {
           rawMessage: err.message || "Unknown proxy exception",
           provider: targetUrl,
           model: finalModel,
-          stats: { payloadMB, images: 0, base64MB: "0.00", msgCount: 0 }
+          stats: { payloadMB, images: 0, base64MB: "0.00", msgCount: 0 },
+          tokenInfo
         });
 
         return formatChatDiagnostic({
@@ -340,6 +361,7 @@ export default {
           provider: targetUrl,
           model: finalModel,
           payloadMB,
+          tokenInfo,
           ...diag
         });
       }
@@ -348,6 +370,24 @@ export default {
     return new Response("Not Found", { status: 404 });
   }
 };
+
+function ensureUserMessage(messages) {
+  const hasUser = messages.some((m) => m.role === "user");
+  if (hasUser) return messages;
+
+  const sysIdx = messages.findIndex((m) => m.role === "system");
+  const fallbackUser = {
+    role: "user",
+    content: "Continue executing the coding task based on the latest tool outputs."
+  };
+
+  if (sysIdx >= 0) {
+    const copy = [...messages];
+    copy.splice(sysIdx + 1, 0, fallbackUser);
+    return copy;
+  }
+  return [fallbackUser, ...messages];
+}
 
 function enforceTokenBudget(messages, tools, maxCharsBudget = 14000) {
   const shrinkContent = (content, limit) => {
@@ -370,7 +410,7 @@ function enforceTokenBudget(messages, tools, maxCharsBudget = 14000) {
     return content;
   };
 
-  // 1. Compact system & user/tool messages (handles both string and array content)
+  // 1. Compact system & user/tool messages
   const compactMsgs = messages.map((m) => {
     if (m.role === "system") {
       const rawSys = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
@@ -381,7 +421,7 @@ function enforceTokenBudget(messages, tools, maxCharsBudget = 14000) {
     }
     return {
       ...m,
-      content: shrinkContent(m.content, 4500)
+      content: shrinkContent(m.content, 4000)
     };
   });
 
@@ -409,16 +449,30 @@ function enforceTokenBudget(messages, tools, maxCharsBudget = 14000) {
       };
     });
 
-  // 3. Keep only latest messages so total payload stays under maxCharsBudget (~3500-4500 tokens)
+  // 3. Always preserve the latest user message so Qwen/Groq templates never fail
   const sys = compactMsgs.filter((m) => m.role === "system");
-  let rest = compactMsgs.filter((m) => m.role !== "system").slice(-4);
+  const nonSys = compactMsgs.filter((m) => m.role !== "system");
+  const lastUserIdx = nonSys.map((m) => m.role).lastIndexOf("user");
+  const lastUserMsg = lastUserIdx >= 0 ? nonSys[lastUserIdx] : null;
 
-  while (rest.length > 1 && JSON.stringify({ sys, rest, slimTools }).length > maxCharsBudget) {
-    rest = rest.slice(1);
+  let rest = nonSys.slice(-4);
+  if (lastUserMsg && !rest.some((m) => m.role === "user")) {
+    rest = [lastUserMsg, ...rest.slice(-3)];
   }
 
-  const finalTools = JSON.stringify({ sys, rest, slimTools }).length <= maxCharsBudget ? slimTools : [];
-  return { messages: [...sys, ...rest], tools: finalTools };
+  while (rest.length > 1 && JSON.stringify({ sys, rest, slimTools }).length > maxCharsBudget) {
+    // Drop oldest non-user message first, never drop the last user message
+    const dropIdx = rest.findIndex((m) => m !== lastUserMsg);
+    if (dropIdx >= 0) {
+      rest.splice(dropIdx, 1);
+    } else {
+      break;
+    }
+  }
+
+  const finalMsgs = ensureUserMessage([...sys, ...rest]);
+  const finalTools = JSON.stringify({ finalMsgs, slimTools }).length <= maxCharsBudget ? slimTools : [];
+  return { messages: finalMsgs, tools: finalTools };
 }
 
 function inspectPayloadStats(reqObj, payloadBytes, payloadMB) {
@@ -446,17 +500,24 @@ function inspectPayloadStats(reqObj, payloadBytes, payloadMB) {
   };
 }
 
-function diagnoseBug({ statusCode, rawMessage, provider, model, stats }) {
+function diagnoseBug({ statusCode, rawMessage, provider, model, stats, tokenInfo }) {
   const msgLower = (rawMessage || "").toLowerCase();
+
+  if (msgLower.includes("no user query found in messages")) {
+    return {
+      title: "Qwen Chat Template Bug (Missing User Turn)",
+      rawError: rawMessage,
+      cause: "Tool execution ke baad history trim hone par user message array se hat gaya tha, jise Qwen ka template reject karta hai.",
+      solution: "Is updated proxy version mein latest 'user' message ko automatically preserve kar diya gaya hai—ab ye error nahi aayega."
+    };
+  }
 
   if (statusCode === 401 || statusCode === 403 || msgLower.includes("api key") || msgLower.includes("unauthorized") || msgLower.includes("invalid key")) {
     return {
       title: "API Key / Authentication Bug",
       rawError: rawMessage,
-      cause: `${provider} ne API key reject kar di. Key invalid/expired ho sakti hai ya wrong provider prefix use ho raha hai.`,
-      solution:
-        "1. Sahi provider ki valid key use karein (OpenRouter: sk-or-..., Groq: gsk_..., Gemini: AIza..., OpenAI: sk-...).\n" +
-        "2. Key revoke/expire hui ho toh nayi key generate karke update karein."
+      cause: `${provider} ne API key reject kar di.`,
+      solution: "Sahi provider ki valid key use karein (OpenRouter: sk-or-..., Groq: gsk_..., Gemini: AIza..., OpenAI: sk-...)."
     };
   }
 
@@ -468,10 +529,8 @@ function diagnoseBug({ statusCode, rawMessage, provider, model, stats }) {
     return {
       title: "Model Not Found / Unavailable Bug",
       rawError: rawMessage,
-      cause: `Model "${model}" ${provider} par available nahi hai, ya is API key/account ko is model ka access nahi hai.`,
-      solution:
-        "1. X-Target-Model header ko apne account ke kisi active aur supported model ID mein badlein.\n" +
-        "2. Agar provider par TPM/context limit ya model access ka issue aa raha hai, toh OpenRouter / Gemini / OpenAI key try karein."
+      cause: `Model "${model}" ${provider} par available nahi hai.`,
+      solution: "X-Target-Model header ko apne account ke active model ID mein badlein."
     };
   }
 
@@ -479,55 +538,31 @@ function diagnoseBug({ statusCode, rawMessage, provider, model, stats }) {
     statusCode === 413 ||
     msgLower.includes("tokens per minute") ||
     msgLower.includes("tpm") ||
-    msgLower.includes("32mb") ||
     msgLower.includes("too large") ||
-    msgLower.includes("context length") ||
-    msgLower.includes("max_tokens") ||
-    msgLower.includes("payload")
+    msgLower.includes("context length")
   ) {
-    const isTpmError = msgLower.includes("tokens per minute") || msgLower.includes("tpm");
     return {
-      title: isTpmError ? "Groq / Provider TPM Token Limit Bug" : "Payload / Context Size Limit Bug",
+      title: "Groq / Provider TPM Token Limit Bug",
       rawError: rawMessage,
-      cause: isTpmError
-        ? `Payload size sirf ${stats.payloadMB} MB hai, lekin input tokens ${provider} (${model}) ke ITPM/TPM limit se zyada hain.`
-        : `Request ka size ~${stats.payloadMB} MB hai (Messages: ${stats.msgCount}, Images: ${stats.images}, Base64: ${stats.base64MB} MB).`,
-      solution: isTpmError
-        ? "1. Worker code save & deploy hua hai ya nahi ye verify karein (auto-slimmer 18k chars budget lagata hai).\n" +
-          "2. Agar ek single message hi bahut bada hai toh chhota prompt bhejein ya OpenRouter/Gemini/OpenAI key use karein."
-        : "1. /clear chalayein ya naya session shuru karein.\n2. Badi images/files compress ya chhote chunks mein bhejein."
+      cause: `Raw request ~${tokenInfo?.rawEstTokens || 0} tokens ka tha; trim ke baad ~${tokenInfo?.sentEstTokens || 0} tokens bheje gaye, jo ${provider} (${model}) ke limit se zyada hain.`,
+      solution: "/clear chalayein ya chhota prompt bhejein."
     };
   }
 
-  if (statusCode === 429 || msgLower.includes("rate limit") || msgLower.includes("quota") || msgLower.includes("too many requests")) {
+  if (statusCode === 429 || msgLower.includes("rate limit") || msgLower.includes("quota")) {
     return {
       title: "Rate Limit / Quota Exceeded Bug",
       rawError: rawMessage,
-      cause: `${provider} par requests/tokens/credits ki limit (RPM/TPM/quota) hit ho gayi hai.`,
-      solution:
-        "1. 30–60 seconds ruk kar dubara try karein.\n" +
-        "2. Doosra model ya billing/credits wala account use karein."
-    };
-  }
-
-  if (statusCode >= 500 || msgLower.includes("timeout") || msgLower.includes("fetch failed") || msgLower.includes("bad gateway")) {
-    return {
-      title: "Upstream Model / Server Error",
-      rawError: rawMessage,
-      cause: `${provider} (${model}) side par temporary server error ya timeout aaya hai.`,
-      solution:
-        "1. Thodi der baad retry karein.\n" +
-        "2. X-Target-Model se model switch karke test karein."
+      cause: `${provider} par requests/tokens limit hit ho gayi hai.`,
+      solution: "30–60 seconds ruk kar dubara try karein."
     };
   }
 
   return {
     title: "Model / Request Processing Bug",
     rawError: rawMessage,
-    cause: `Model "${model}" (${provider}) ne request process karte waqt error diya (Payload: ${stats.payloadMB} MB).`,
-    solution:
-      "1. Upar 'Raw Error' mein diya gaya exact message dekhein.\n" +
-      "2. Pehle ek chhote prompt ('hi') se test karein."
+    cause: `Model "${model}" (${provider}) ne request process karte waqt error diya.`,
+    solution: "Upar 'Raw Error' mein diya gaya exact message dekhein."
   };
 }
 
@@ -539,16 +574,20 @@ function formatChatDiagnostic({
   provider,
   model,
   payloadMB,
+  tokenInfo,
   rawError,
   cause,
   solution
 }) {
+  const tokenLine = `- **Token Usage (Est):** Raw \`~${tokenInfo?.rawEstTokens ?? 0}\` tokens → Sent \`~${tokenInfo?.sentEstTokens ?? 0}\` tokens (${tokenInfo?.trimmed ? "Auto-Trimmed" : "Full"})\n`;
+
   const reportText =
     `### Proxy Bug Alert: ${title}\n\n` +
     `- **Status:** HTTP ${statusCode}\n` +
     `- **Provider:** ${provider}\n` +
     `- **Model:** \`${model}\` (Requested: \`${reqModel}\`)\n` +
     `- **Payload Size:** ${payloadMB} MB\n` +
+    tokenLine +
     `- **Raw Error:** \`${rawError}\`\n\n` +
     `**Kya Problem Hai:**\n${cause}\n\n` +
     `**Solution:**\n${solution}`;
@@ -570,7 +609,7 @@ function formatChatDiagnostic({
       model: reqModel,
       content: [],
       stop_reason: null,
-      usage: { input_tokens: 10, output_tokens: 20 }
+      usage: { input_tokens: tokenInfo?.sentEstTokens || 10, output_tokens: 20 }
     };
 
     const sse =
