@@ -6,8 +6,8 @@ export default {
     if (request.method === "GET") {
       return new Response(JSON.stringify({
         status: "running",
-        project: "kaps-cup universal AI proxy",
-        supported_providers: ["Gemini", "Groq", "OpenRouter", "OpenAI"]
+        project: "kaps-cup universal smart AI proxy",
+        usage: "Set X-Target-Model header in settings.json to use ANY model from Groq, Gemini, OpenRouter, or OpenAI"
       }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
@@ -20,9 +20,13 @@ export default {
         const anthropicReq = await request.json();
         const rawAuth = request.headers.get("x-api-key") || request.headers.get("authorization") || "";
         const apiKey = rawAuth.replace("Bearer ", "").trim();
-        const model = anthropicReq.model || "gemini-2.5-flash";
 
-        // 1. Convert Anthropic messages to OpenAI-compatible format
+        // 1. Custom Header se Model padhein (agar nahi diya to key ke hisaab se default chunein)
+        const customModelHeader = request.headers.get("x-target-model")?.trim();
+        const reqModel = anthropicReq.model || "";
+        const selectedModel = customModelHeader || (!reqModel.startsWith("claude-") ? reqModel : "");
+
+        // 2. Convert Anthropic messages to OpenAI-compatible format
         const openAiMessages = [];
 
         if (anthropicReq.system) {
@@ -78,25 +82,41 @@ export default {
           }
         }));
 
-        // 2. Route to Provider based on Model Prefix
+        // 3. Smart Provider & Model Routing (Key + Selected Model ke base par)
         let targetUrl = "";
-        let cleanModelName = model;
+        let finalModel = selectedModel;
+        const headers = {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        };
 
-        if (model.startsWith("gemini")) {
-          targetUrl = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-        } else if (model.startsWith("groq/")) {
+        if (apiKey.startsWith("gsk_")) {
+          // GROQ Provider
           targetUrl = "https://api.groq.com/openai/v1/chat/completions";
-          cleanModelName = model.replace("groq/", "");
-        } else if (model.startsWith("openai/")) {
-          targetUrl = "https://api.openai.com/v1/chat/completions";
-          cleanModelName = model.replace("openai/", "");
-        } else {
-          // Default to OpenRouter (supports all free & paid models)
+          finalModel = (selectedModel || "llama-3.3-70b-versatile").replace(/^groq\//, "");
+        } else if (apiKey.startsWith("AIza")) {
+          // GOOGLE GEMINI Provider
+          targetUrl = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+          finalModel = (selectedModel || "gemini-2.5-flash-lite").replace(/^google\//, "");
+          headers["x-goog-api-key"] = apiKey;
+        } else if (apiKey.startsWith("sk-or-")) {
+          // OPENROUTER Provider (Koi bhi free/paid model chalayein)
           targetUrl = "https://openrouter.ai/api/v1/chat/completions";
+          finalModel = selectedModel || "cohere/north-mini-code:free";
+          headers["HTTP-Referer"] = "https://kaps-cup.workers.dev";
+          headers["X-Title"] = "kaps-cup-proxy";
+        } else if (apiKey.startsWith("sk-")) {
+          // OFFICIAL OPENAI Provider
+          targetUrl = "https://api.openai.com/v1/chat/completions";
+          finalModel = (selectedModel || "gpt-4o-mini").replace(/^openai\//, "");
+        } else {
+          // Fallback: OpenAI-compatible custom endpoint (e.g., Requesty, Together, DeepSeek)
+          targetUrl = "https://openrouter.ai/api/v1/chat/completions";
+          finalModel = selectedModel || "openrouter/free";
         }
 
         const providerPayload = {
-          model: cleanModelName,
+          model: finalModel,
           messages: openAiMessages,
           max_tokens: anthropicReq.max_tokens || 4096,
           temperature: anthropicReq.temperature ?? 0.2,
@@ -107,17 +127,7 @@ export default {
           providerPayload.tools = openAiTools;
         }
 
-        // 3. Call Target AI API
-        const headers = {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        };
-
-        // Google Gemini ke liye extra header taaki API key reject na ho
-        if (model.startsWith("gemini")) {
-          headers["x-goog-api-key"] = apiKey;
-        }
-
+        // 4. Call Target AI API
         const aiRes = await fetch(targetUrl, {
           method: "POST",
           headers: headers,
@@ -129,11 +139,14 @@ export default {
         if (!aiRes.ok) {
           return new Response(JSON.stringify({
             type: "error",
-            error: { type: "api_error", message: aiData.error?.message || JSON.stringify(aiData) }
+            error: {
+              type: "api_error",
+              message: `[${finalModel}] ${aiData.error?.message || JSON.stringify(aiData)}`
+            }
           }), { status: aiRes.status, headers: { "Content-Type": "application/json" } });
         }
 
-        // 4. Convert Response back to Anthropic Format
+        // 5. Convert Response back to Anthropic Format
         const choice = aiData.choices?.[0]?.message || {};
         const contentBlocks = [];
 
@@ -158,7 +171,7 @@ export default {
           id: "msg_" + Date.now(),
           type: "message",
           role: "assistant",
-          model: model,
+          model: reqModel || "claude-sonnet-4-5",
           content: contentBlocks.length > 0 ? contentBlocks : [{ type: "text", text: "" }],
           stop_reason: choice.tool_calls?.length > 0 ? "tool_use" : "end_turn",
           usage: {
@@ -167,7 +180,7 @@ export default {
           }
         };
 
-        // Handle Streaming (SSE) if requested by Claude Code
+        // Handle Streaming (SSE)
         if (anthropicReq.stream) {
           const sse = [
             `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { ...anthropicResponse, content: [] } })}\n\n`,
