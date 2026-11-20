@@ -201,7 +201,7 @@ export default {
 
         // Hard Token Budget Enforcement for Groq (7000 ITPM limit -> target <= 4500 tokens)
         if (providerName === "Groq") {
-          const slimmed = enforceTokenBudget(openAiMessages, openAiTools, 14000);
+          const slimmed = enforceTokenBudget(openAiMessages, openAiTools, 9500);
           openAiMessages = slimmed.messages;
           openAiTools = slimmed.tools;
           tokenInfo.trimmed = true;
