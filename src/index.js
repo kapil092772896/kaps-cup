@@ -349,24 +349,40 @@ export default {
   }
 };
 
-function enforceTokenBudget(messages, tools, maxCharsBudget = 18000) {
-  // 1. Compact system prompt to max 1000 chars
+function enforceTokenBudget(messages, tools, maxCharsBudget = 14000) {
+  const shrinkContent = (content, limit) => {
+    if (typeof content === "string") {
+      return content.length > limit
+        ? content.slice(0, Math.floor(limit * 0.6)) + "\n...[trimmed]...\n" + content.slice(-Math.floor(limit * 0.35))
+        : content;
+    }
+    if (Array.isArray(content)) {
+      return content.map((part) => {
+        if (part?.type === "text" && typeof part.text === "string" && part.text.length > limit) {
+          return {
+            ...part,
+            text: part.text.slice(0, Math.floor(limit * 0.6)) + "\n...[trimmed]...\n" + part.text.slice(-Math.floor(limit * 0.35))
+          };
+        }
+        return part;
+      });
+    }
+    return content;
+  };
+
+  // 1. Compact system & user/tool messages (handles both string and array content)
   const compactMsgs = messages.map((m) => {
-    if (m.role === "system" && typeof m.content === "string") {
+    if (m.role === "system") {
+      const rawSys = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
       return {
         role: "system",
-        content:
-          "You are an expert AI coding assistant in Claude Code. Be concise and accurate.\n" +
-          m.content.slice(0, 800)
+        content: "You are an expert AI coding assistant in Claude Code. Be concise.\n" + rawSys.slice(0, 700)
       };
     }
-    if (typeof m.content === "string" && m.content.length > 6000) {
-      return {
-        ...m,
-        content: m.content.slice(0, 3000) + "\n...[truncated for TPM limit]...\n" + m.content.slice(-2500)
-      };
-    }
-    return m;
+    return {
+      ...m,
+      content: shrinkContent(m.content, 4500)
+    };
   });
 
   // 2. Keep only 5 core tools with minimal schema
@@ -383,7 +399,7 @@ function enforceTokenBudget(messages, tools, maxCharsBudget = 18000) {
         type: "function",
         function: {
           name: t.function.name,
-          description: (t.function.description || "").slice(0, 60),
+          description: (t.function.description || "").slice(0, 50),
           parameters: {
             type: "object",
             properties: cleanProps,
@@ -393,7 +409,7 @@ function enforceTokenBudget(messages, tools, maxCharsBudget = 18000) {
       };
     });
 
-  // 3. Keep only latest messages so total JSON chars stay under maxCharsBudget
+  // 3. Keep only latest messages so total payload stays under maxCharsBudget (~3500-4500 tokens)
   const sys = compactMsgs.filter((m) => m.role === "system");
   let rest = compactMsgs.filter((m) => m.role !== "system").slice(-4);
 
@@ -401,10 +417,8 @@ function enforceTokenBudget(messages, tools, maxCharsBudget = 18000) {
     rest = rest.slice(1);
   }
 
-  return {
-    messages: [...sys, ...rest],
-    tools: JSON.stringify({ sys, rest, slimTools }).length <= maxCharsBudget ? slimTools : []
-  };
+  const finalTools = JSON.stringify({ sys, rest, slimTools }).length <= maxCharsBudget ? slimTools : [];
+  return { messages: [...sys, ...rest], tools: finalTools };
 }
 
 function inspectPayloadStats(reqObj, payloadBytes, payloadMB) {
