@@ -4,14 +4,39 @@ export default {
 
     // Health check endpoint
     if (request.method === "GET") {
+      // 1. Models List Endpoint (Claude Code startup validation ke liye zaroori)
+    if (request.method === "GET" && url.pathname.endsWith("/v1/models")) {
       return new Response(JSON.stringify({
-        status: "running",
-        project: "kaps-cup universal smart AI proxy",
-        usage: "Set X-Target-Model header in settings.json to use ANY model from Groq, Gemini, OpenRouter, or OpenAI"
+        data: [
+          { id: "claude-sonnet-4-5-20250929", object: "model", created: 1735689600, owned_by: "anthropic" },
+          { id: "claude-3-5-sonnet-20241022", object: "model", created: 1735689600, owned_by: "anthropic" },
+          { id: "claude-haiku-4-5-20251001", object: "model", created: 1735689600, owned_by: "anthropic" }
+        ]
       }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
+    }
+
+    // 2. Token Count Endpoint (Claude Code context check ke liye)
+    if (request.method === "POST" && url.pathname.endsWith("/v1/messages/count_tokens")) {
+      return new Response(JSON.stringify({ input_tokens: 100 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // 3. Health check endpoint
+    if (request.method === "GET") {
+      return new Response(JSON.stringify({
+        status: "running",
+        project: "kaps-cup universal smart AI proxy",
+        usage: "Set X-Target-Model header in settings.json to use ANY model"
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
     }
 
     // Claude Code Messages Endpoint
