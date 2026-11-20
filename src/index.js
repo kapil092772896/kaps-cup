@@ -194,7 +194,56 @@ export default {
           targetUrl = "https://openrouter.ai/api/v1/chat/completions";
           finalModel = selectedModel || "openrouter/free";
         }
-
+        // Groq Free/On-Demand ITPM Limit (7k-8k tokens) ke liye smart payload compression
+        if (providerName === "Groq") {
+          // 1. System prompt ko compact karein (max 1800 chars)
+          for (const m of openAiMessages) {
+            if (m.role === "system" && typeof m.content === "string" && m.content.length > 1800) {
+              m.content =
+                "You are Claude Code, an expert AI coding assistant. Use available tools accurately and concisely.\n\n" +
+                m.content.slice(0, 1500);
+            }
+          }
+        
+          // 2. Sirf core coding tools rakhein aur unke heavy descriptions trim karein
+          const coreTools = new Set(["Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep", "LS"]);
+          const slimTools = openAiTools
+            .filter((t) => coreTools.has(t.function.name))
+            .map((t) => {
+              const cleanProps = {};
+              const props = t.function.parameters?.properties || {};
+              for (const [k, v] of Object.entries(props)) {
+                cleanProps[k] = {
+                  type: v.type || "string",
+                  ...(v.enum ? { enum: v.enum } : {}),
+                  ...(v.items ? { items: { type: v.items.type || "string" } } : {})
+                };
+              }
+              return {
+                type: "function",
+                function: {
+                  name: t.function.name,
+                  description: (t.function.description || "").slice(0, 100),
+                  parameters: {
+                    type: "object",
+                    properties: cleanProps,
+                    required: t.function.parameters?.required || []
+                  }
+                }
+              };
+            });
+        
+          openAiTools.length = 0;
+          openAiTools.push(...slimTools);
+        
+          // 3. Agar conversation history bahut badi ho gayi hai toh sirf aakhiri 6 messages rakhein
+          const sysMsgs = openAiMessages.filter((m) => m.role === "system");
+          const chatMsgs = openAiMessages.filter((m) => m.role !== "system");
+          if (chatMsgs.length > 6) {
+            openAiMessages.length = 0;
+            openAiMessages.push(...sysMsgs, ...chatMsgs.slice(-6));
+          }
+        }
         const providerPayload = {
           model: finalModel,
           messages: openAiMessages,
