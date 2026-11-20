@@ -29,7 +29,7 @@ export default {
       return new Response(
         JSON.stringify({
           status: "running",
-          project: "kaps-cup smart bug-reporting AI proxy",
+          project: "kaps-cup smart auto-slimming AI proxy",
           usage: "Set X-Target-Model header in settings.json to use ANY model"
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
@@ -62,8 +62,8 @@ export default {
             model: "N/A",
             payloadMB,
             rawError: parseErr.message,
-            cause: "Client se bheja gaya request JSON valid nahi hai ya beech mein cut gaya hai.",
-            solution: "1. Ek naya session/prompt try karein.\n2. Agar badi file/image paste ki hai toh chhote chunks mein bhejein."
+            cause: "Client se bheja gaya request JSON valid nahi hai.",
+            solution: "Ek naya session/prompt try karein."
           });
         }
 
@@ -88,12 +88,12 @@ export default {
             payloadMB: stats.payloadMB,
             rawError: "No x-api-key or Authorization header received.",
             cause: "Claude Code se proxy ko API key nahi mil rahi hai.",
-            solution: "1. Environment ya settings.json mein ANTHROPIC_API_KEY (ya provider key) set karein.\n2. Terminal restart karke dubara claude chalayein."
+            solution: "settings.json ya env mein ANTHROPIC_API_KEY set karein aur terminal restart karein."
           });
         }
 
         // Convert Anthropic messages to OpenAI-compatible format
-        const openAiMessages = [];
+        let openAiMessages = [];
         if (anthropicReq.system) {
           const sysText = Array.isArray(anthropicReq.system)
             ? anthropicReq.system.map((s) => s.text || "").join("\n")
@@ -153,7 +153,7 @@ export default {
           }
         }
 
-        const openAiTools = (anthropicReq.tools || []).map((t) => ({
+        let openAiTools = (anthropicReq.tools || []).map((t) => ({
           type: "function",
           function: {
             name: t.name,
@@ -173,7 +173,7 @@ export default {
         if (apiKey.startsWith("gsk_")) {
           providerName = "Groq";
           targetUrl = "https://api.groq.com/openai/v1/chat/completions";
-          finalModel = (selectedModel || "llama-3.3-70b-versatile").replace(/^groq\//, "");
+          finalModel = (selectedModel || "llama-3.1-8b-instant").replace(/^groq\//, "");
         } else if (apiKey.startsWith("AIza")) {
           providerName = "Google Gemini";
           targetUrl = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
@@ -194,60 +194,18 @@ export default {
           targetUrl = "https://openrouter.ai/api/v1/chat/completions";
           finalModel = selectedModel || "openrouter/free";
         }
-        // Groq Free/On-Demand ITPM Limit (7k-8k tokens) ke liye smart payload compression
+
+        // Hard Token Budget Enforcement for Groq (7000 ITPM limit -> target <= 5000 tokens)
         if (providerName === "Groq") {
-          // 1. System prompt ko compact karein (max 1800 chars)
-          for (const m of openAiMessages) {
-            if (m.role === "system" && typeof m.content === "string" && m.content.length > 1800) {
-              m.content =
-                "You are Claude Code, an expert AI coding assistant. Use available tools accurately and concisely.\n\n" +
-                m.content.slice(0, 1500);
-            }
-          }
-        
-          // 2. Sirf core coding tools rakhein aur unke heavy descriptions trim karein
-          const coreTools = new Set(["Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep", "LS"]);
-          const slimTools = openAiTools
-            .filter((t) => coreTools.has(t.function.name))
-            .map((t) => {
-              const cleanProps = {};
-              const props = t.function.parameters?.properties || {};
-              for (const [k, v] of Object.entries(props)) {
-                cleanProps[k] = {
-                  type: v.type || "string",
-                  ...(v.enum ? { enum: v.enum } : {}),
-                  ...(v.items ? { items: { type: v.items.type || "string" } } : {})
-                };
-              }
-              return {
-                type: "function",
-                function: {
-                  name: t.function.name,
-                  description: (t.function.description || "").slice(0, 100),
-                  parameters: {
-                    type: "object",
-                    properties: cleanProps,
-                    required: t.function.parameters?.required || []
-                  }
-                }
-              };
-            });
-        
-          openAiTools.length = 0;
-          openAiTools.push(...slimTools);
-        
-          // 3. Agar conversation history bahut badi ho gayi hai toh sirf aakhiri 6 messages rakhein
-          const sysMsgs = openAiMessages.filter((m) => m.role === "system");
-          const chatMsgs = openAiMessages.filter((m) => m.role !== "system");
-          if (chatMsgs.length > 6) {
-            openAiMessages.length = 0;
-            openAiMessages.push(...sysMsgs, ...chatMsgs.slice(-6));
-          }
+          const slimmed = enforceTokenBudget(openAiMessages, openAiTools, 18000); // ~4500-5000 tokens max
+          openAiMessages = slimmed.messages;
+          openAiTools = slimmed.tools;
         }
+
         const providerPayload = {
           model: finalModel,
           messages: openAiMessages,
-          max_tokens: anthropicReq.max_tokens || 4096,
+          max_tokens: Math.min(anthropicReq.max_tokens || 2048, providerName === "Groq" ? 1500 : 4096),
           temperature: anthropicReq.temperature ?? 0.2,
           stream: false
         };
@@ -256,11 +214,22 @@ export default {
           providerPayload.tools = openAiTools;
         }
 
-        const aiRes = await fetch(targetUrl, {
+        let aiRes = await fetch(targetUrl, {
           method: "POST",
           headers,
           body: JSON.stringify(providerPayload)
         });
+
+        // Auto-retry without tools if Groq still hits 413 TPM limit
+        if (aiRes.status === 413 && providerName === "Groq" && providerPayload.tools) {
+          delete providerPayload.tools;
+          providerPayload.messages = enforceTokenBudget(openAiMessages, [], 12000).messages;
+          aiRes = await fetch(targetUrl, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(providerPayload)
+          });
+        }
 
         const rawText = await aiRes.text();
         let aiData = null;
@@ -380,6 +349,64 @@ export default {
   }
 };
 
+function enforceTokenBudget(messages, tools, maxCharsBudget = 18000) {
+  // 1. Compact system prompt to max 1000 chars
+  const compactMsgs = messages.map((m) => {
+    if (m.role === "system" && typeof m.content === "string") {
+      return {
+        role: "system",
+        content:
+          "You are an expert AI coding assistant in Claude Code. Be concise and accurate.\n" +
+          m.content.slice(0, 800)
+      };
+    }
+    if (typeof m.content === "string" && m.content.length > 6000) {
+      return {
+        ...m,
+        content: m.content.slice(0, 3000) + "\n...[truncated for TPM limit]...\n" + m.content.slice(-2500)
+      };
+    }
+    return m;
+  });
+
+  // 2. Keep only 5 core tools with minimal schema
+  const coreTools = new Set(["Read", "Write", "Edit", "Bash", "Grep"]);
+  const slimTools = tools
+    .filter((t) => coreTools.has(t.function?.name))
+    .map((t) => {
+      const cleanProps = {};
+      const props = t.function.parameters?.properties || {};
+      for (const [k, v] of Object.entries(props)) {
+        cleanProps[k] = { type: v.type || "string" };
+      }
+      return {
+        type: "function",
+        function: {
+          name: t.function.name,
+          description: (t.function.description || "").slice(0, 60),
+          parameters: {
+            type: "object",
+            properties: cleanProps,
+            required: t.function.parameters?.required || []
+          }
+        }
+      };
+    });
+
+  // 3. Keep only latest messages so total JSON chars stay under maxCharsBudget
+  const sys = compactMsgs.filter((m) => m.role === "system");
+  let rest = compactMsgs.filter((m) => m.role !== "system").slice(-4);
+
+  while (rest.length > 1 && JSON.stringify({ sys, rest, slimTools }).length > maxCharsBudget) {
+    rest = rest.slice(1);
+  }
+
+  return {
+    messages: [...sys, ...rest],
+    tools: JSON.stringify({ sys, rest, slimTools }).length <= maxCharsBudget ? slimTools : []
+  };
+}
+
 function inspectPayloadStats(reqObj, payloadBytes, payloadMB) {
   const msgs = Array.isArray(reqObj.messages) ? reqObj.messages : [];
   let images = 0;
@@ -408,87 +435,85 @@ function inspectPayloadStats(reqObj, payloadBytes, payloadMB) {
 function diagnoseBug({ statusCode, rawMessage, provider, model, stats }) {
   const msgLower = (rawMessage || "").toLowerCase();
 
-  // 1. Auth / API Key errors
   if (statusCode === 401 || statusCode === 403 || msgLower.includes("api key") || msgLower.includes("unauthorized") || msgLower.includes("invalid key")) {
     return {
       title: "API Key / Authentication Bug",
       rawError: rawMessage,
-      cause: `${provider} ne API key reject kar di. Key invalid/expired ho sakti hai ya key ka prefix (${provider}) se match nahi kar raha.`,
+      cause: `${provider} ne API key reject kar di. Key invalid/expired ho sakti hai ya wrong provider prefix use ho raha hai.`,
       solution:
-        "1. Check karein ki aap sahi provider ki key use kar rahe hain (OpenRouter: sk-or-..., Groq: gsk_..., Gemini: AIza..., OpenAI: sk-...).\n" +
-        "2. Key expire ya revoke hui ho toh nayi key generate karke update karein."
+        "1. Sahi provider ki valid key use karein (OpenRouter: sk-or-..., Groq: gsk_..., Gemini: AIza..., OpenAI: sk-...).\n" +
+        "2. Key revoke/expire hui ho toh nayi key generate karke update karein."
     };
   }
 
-  // 2. Model not found / unavailable
-  if (statusCode === 404 || msgLower.includes("model") && (msgLower.includes("not found") || msgLower.includes("does not exist") || msgLower.includes("no endpoints"))) {
+  if (
+    statusCode === 404 ||
+    (msgLower.includes("model") &&
+      (msgLower.includes("not found") || msgLower.includes("does not exist") || msgLower.includes("no endpoints")))
+  ) {
     return {
       title: "Model Not Found / Unavailable Bug",
       rawError: rawMessage,
-      cause: `Model "${model}" ${provider} par available nahi hai, ya free/paid access restricted hai.`,
+      cause: `Model "${model}" ${provider} par available nahi hai, ya is API key/account ko is model ka access nahi hai.`,
       solution:
-        "1. X-Target-Model header ya model name ko ek valid active model mein badlein (jaise OpenRouter ke liye 'openrouter/free' ya 'cohere/north-mini-code:free', Groq ke liye 'llama-3.3-70b-versatile').\n" +
-        "2. Agar free model temporary down hai toh doosra working model try karein."
+        "1. X-Target-Model header ko apne account ke kisi active aur supported model ID mein badlein.\n" +
+        "2. Agar provider par TPM/context limit ya model access ka issue aa raha hai, toh OpenRouter / Gemini / OpenAI key try karein."
     };
   }
 
-  // 3. Payload / Context / Size / 32MB limit issues
-  // diagnoseBug ke andar "3. Payload / Context / Size / 32MB limit issues" wale block ko isse replace karein:
-if (
-  statusCode === 413 ||
-  msgLower.includes("tokens per minute") ||
-  msgLower.includes("tpm") ||
-  msgLower.includes("32mb") ||
-  msgLower.includes("too large") ||
-  msgLower.includes("context length") ||
-  msgLower.includes("max_tokens") ||
-  msgLower.includes("payload")
-) {
-  const isTpmError = msgLower.includes("tokens per minute") || msgLower.includes("tpm");
-  return {
-    title: isTpmError ? "Groq / Provider TPM Token Limit Bug" : "Payload / Context Size Limit Bug",
-    rawError: rawMessage,
-    cause: isTpmError
-      ? `Payload size sirf ${stats.payloadMB} MB hai, lekin Claude Code ke system prompt + tools ki wajah se request mein ~34k+ tokens ban rahe hain, jo ${provider} (${model}) ke TPM limit se zyada hain.`
-      : `Request ka size ~${stats.payloadMB} MB hai (Messages: ${stats.msgCount}, Images: ${stats.images}, Base64: ${stats.base64MB} MB). Input ya image/context size limit se zyada ja raha hai.`,
-    solution: isTpmError
-      ? "1. Model badlein (X-Target-Model mein zyada TPM/context wala model set karein) ya Groq billing/tier check karein.\n2. Claude Code mein heavy MCP servers/tools kam karein ya OpenRouter/Gemini/OpenAI provider try karein."
-      : "1. Naya session shuru karein ya /clear chalayein taaki purani context/attachments hat jayein.\n2. Badi images/screenshots compress karein ya poore file paste karne ke bajay sirf relevant lines/file path dein."
-  };
-}
+  if (
+    statusCode === 413 ||
+    msgLower.includes("tokens per minute") ||
+    msgLower.includes("tpm") ||
+    msgLower.includes("32mb") ||
+    msgLower.includes("too large") ||
+    msgLower.includes("context length") ||
+    msgLower.includes("max_tokens") ||
+    msgLower.includes("payload")
+  ) {
+    const isTpmError = msgLower.includes("tokens per minute") || msgLower.includes("tpm");
+    return {
+      title: isTpmError ? "Groq / Provider TPM Token Limit Bug" : "Payload / Context Size Limit Bug",
+      rawError: rawMessage,
+      cause: isTpmError
+        ? `Payload size sirf ${stats.payloadMB} MB hai, lekin input tokens ${provider} (${model}) ke ITPM/TPM limit se zyada hain.`
+        : `Request ka size ~${stats.payloadMB} MB hai (Messages: ${stats.msgCount}, Images: ${stats.images}, Base64: ${stats.base64MB} MB).`,
+      solution: isTpmError
+        ? "1. Worker code save & deploy hua hai ya nahi ye verify karein (auto-slimmer 18k chars budget lagata hai).\n" +
+          "2. Agar ek single message hi bahut bada hai toh chhota prompt bhejein ya OpenRouter/Gemini/OpenAI key use karein."
+        : "1. /clear chalayein ya naya session shuru karein.\n2. Badi images/files compress ya chhote chunks mein bhejein."
+    };
+  }
 
-  // 4. Rate limit / Quota
   if (statusCode === 429 || msgLower.includes("rate limit") || msgLower.includes("quota") || msgLower.includes("too many requests")) {
     return {
       title: "Rate Limit / Quota Exceeded Bug",
       rawError: rawMessage,
-      cause: `${provider} par requests/tokens/credits ki limit (RPM/TPM/free quota) hit ho gayi hai.`,
+      cause: `${provider} par requests/tokens/credits ki limit (RPM/TPM/quota) hit ho gayi hai.`,
       solution:
         "1. 30–60 seconds ruk kar dubara try karein.\n" +
-        "2. Free tier ya rate-limited model ke bajay doosra model ya billing/credits wala account use karein."
+        "2. Doosra model ya billing/credits wala account use karein."
     };
   }
 
-  // 5. Upstream server / timeout / gateway error
   if (statusCode >= 500 || msgLower.includes("timeout") || msgLower.includes("fetch failed") || msgLower.includes("bad gateway")) {
     return {
       title: "Upstream Model / Server Error",
       rawError: rawMessage,
-      cause: `${provider} (${model}) side par temporary server error, timeout, ya invalid response aaya hai.`,
+      cause: `${provider} (${model}) side par temporary server error ya timeout aaya hai.`,
       solution:
-        "1. Thodi der baad retry karein—upstream provider par temporary glitch ho sakta hai.\n" +
-        "2. Agar ek particular model baar-baar fail ho raha hai toh X-Target-Model se model switch karke test karein."
+        "1. Thodi der baad retry karein.\n" +
+        "2. X-Target-Model se model switch karke test karein."
     };
   }
 
-  // 6. Generic / Schema / Tool call bug
   return {
     title: "Model / Request Processing Bug",
     rawError: rawMessage,
     cause: `Model "${model}" (${provider}) ne request process karte waqt error diya (Payload: ${stats.payloadMB} MB).`,
     solution:
-      "1. Upar 'Raw Error' mein diya gaya exact message dekhein ki kaunsa field/parameter reject hua.\n" +
-      "2. Pehle ek chhote prompt ('hi') se test karein taaki pata chale issue prompt/tools ka hai ya model ka."
+      "1. Upar 'Raw Error' mein diya gaya exact message dekhein.\n" +
+      "2. Pehle ek chhote prompt ('hi') se test karein."
   };
 }
 
