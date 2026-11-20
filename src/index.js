@@ -108,12 +108,19 @@ export default {
         }
 
         // 3. Call Target AI API
+        const headers = {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        };
+
+        // Google Gemini ke liye extra header taaki API key reject na ho
+        if (model.startsWith("gemini")) {
+          headers["x-goog-api-key"] = apiKey;
+        }
+
         const aiRes = await fetch(targetUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKey}`
-          },
+          headers: headers,
           body: JSON.stringify(providerPayload)
         });
 
