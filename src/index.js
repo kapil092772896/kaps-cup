@@ -41,22 +41,29 @@ export default {
         return anthropicError("GROQ_API_KEY missing.", 401);
       }
 
-      // 1. Background title/ping calls ko Groq par mat bhejo (0 tokens spent)
+      // 1. COMPLETE BACKGROUND NOISE BLOCKER (System + User dono check karega)
+      const sysText = extractText(body.system).toLowerCase();
       const lastMsg = body.messages?.[body.messages.length - 1];
       const rawText = extractText(lastMsg?.content);
+      const lowerRaw = rawText.toLowerCase();
+
       if (
-        rawText.includes("Please write a 5-10 word title") ||
-        rawText.includes("Generate a concise title")
+        sysText.includes("5-10 word title") ||
+        sysText.includes("concise title") ||
+        sysText.includes("summarize this coding session") ||
+        lowerRaw.includes("please write a 5-10 word title") ||
+        lowerRaw.includes("generate a concise title") ||
+        (lowerRaw.trim() === "ping" || lowerRaw.trim() === "test")
       ) {
-        return buildAnthropicReply({ text: "Coding Task" }, body.stream, body.model);
+        return buildAnthropicReply({ text: "Coding Session" }, body.stream, body.model);
       }
 
-      // 2. Sirf aakhiri 2 messages rakhein (History trim taaki tokens < 600 rahein)
+      // 2. STRICT 500-TOKEN PAYLOAD TRIMMER
       const recentMsgs = (body.messages || []).slice(-2);
       const groqMessages = [
         {
           role: "system",
-          content: "You are Claude Code. Use tools (Write, Edit, Bash, Read) directly to modify files. Be concise.",
+          content: "You are Claude Code. Use Write, Edit, Read, Bash tools directly on files. Keep replies short.",
         },
       ];
 
@@ -65,13 +72,13 @@ export default {
         if (mapped) groqMessages.push(mapped);
       }
 
-      // 3. Ultra-Compact Core Tools (Sirf 4 zaroori tools, ~220 tokens total)
+      // 3. Compact Tools (~220 tokens total, taaki auto file edit chalta rahe)
       const compactTools = [
         {
           type: "function",
           function: {
             name: "Write",
-            description: "Write full content to a file",
+            description: "Write content to file",
             parameters: {
               type: "object",
               properties: {
@@ -86,7 +93,7 @@ export default {
           type: "function",
           function: {
             name: "Edit",
-            description: "Replace string in a file",
+            description: "Replace exact text in file",
             parameters: {
               type: "object",
               properties: {
@@ -102,7 +109,7 @@ export default {
           type: "function",
           function: {
             name: "Read",
-            description: "Read a file",
+            description: "Read file content",
             parameters: {
               type: "object",
               properties: { file_path: { type: "string" } },
@@ -114,7 +121,7 @@ export default {
           type: "function",
           function: {
             name: "Bash",
-            description: "Run shell command",
+            description: "Execute shell command",
             parameters: {
               type: "object",
               properties: { command: { type: "string" } },
@@ -124,13 +131,19 @@ export default {
         },
       ];
 
-      // 4. High-TPM Groq Models (30,000 TPM limit on llama-3.3-70b / 8b)
-      const primaryModel = request.headers.get("X-Target-Model") || env.TARGET_MODEL || "llama-3.3-70b-versatile";
-      const fallbackModel = "llama-3.1-8b-instant";
+      // 4. SMART MODEL ROUTING (Haiku/Background -> 8B Fast Model, Main -> 70B/Custom)
+      const reqModel = (body.model || "").toLowerCase();
+      const isBackgroundModel = reqModel.includes("haiku");
+      const mainModel = request.headers.get("X-Target-Model") || env.TARGET_MODEL || "llama-3.3-70b-versatile";
+      const fastModel = "llama-3.1-8b-instant";
 
-      let groqRes = await callGroq(apiKey, primaryModel, groqMessages, compactTools);
-      if (!groqRes.ok) {
-        groqRes = await callGroq(apiKey, fallbackModel, groqMessages, compactTools);
+      const chosenModel = isBackgroundModel ? fastModel : mainModel;
+
+      let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools);
+
+      // Agar main model 429 ya error de toh turant fastModel par fallback karein
+      if (!groqRes.ok && chosenModel !== fastModel) {
+        groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools);
       }
 
       if (!groqRes.ok) {
@@ -189,22 +202,20 @@ function mapAnthropicToGroqMsg(msg) {
   const content = msg.content;
 
   if (typeof content === "string") {
-    return { role, content: content.slice(-1200) };
+    return { role, content: content.slice(-1000) };
   }
 
   if (Array.isArray(content)) {
-    // Handle tool_result from Claude Code
     const toolRes = content.find((c) => c.type === "tool_result");
     if (toolRes) {
       const out = typeof toolRes.content === "string" ? toolRes.content : JSON.stringify(toolRes.content);
       return {
         role: "tool",
         tool_call_id: toolRes.tool_use_id || "call_1",
-        content: out.slice(0, 800),
+        content: out.slice(0, 600),
       };
     }
 
-    // Handle assistant tool_use history
     const toolUse = content.find((c) => c.type === "tool_use");
     if (toolUse && role === "assistant") {
       return {
@@ -227,7 +238,7 @@ function mapAnthropicToGroqMsg(msg) {
       .filter((c) => c.type === "text" && c.text)
       .map((c) => c.text)
       .join("\n")
-      .slice(-1200);
+      .slice(-1000);
     if (text) return { role, content: text };
   }
   return null;
