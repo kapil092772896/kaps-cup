@@ -2,7 +2,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -13,7 +12,6 @@ export default {
       });
     }
 
-    // 1. Dummy /v1/models endpoint (Claude Code validation ke liye)
     if (url.pathname.endsWith("/v1/models")) {
       return jsonResponse({
         object: "list",
@@ -24,9 +22,8 @@ export default {
       });
     }
 
-    // 2. Dummy /count_tokens endpoint (Zero API call)
     if (url.pathname.endsWith("/count_tokens")) {
-      return jsonResponse({ input_tokens: 250 });
+      return jsonResponse({ input_tokens: 450 });
     }
 
     if (request.method !== "POST") {
@@ -41,68 +38,126 @@ export default {
         (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
 
       if (!apiKey) {
-        return anthropicError("GROQ_API_KEY missing in Worker secrets or headers.", 401);
+        return anthropicError("GROQ_API_KEY missing.", 401);
       }
 
-      // 3. BACKGROUND NOISE BLOCKER:
-      // Claude Code ke title generation & background pings ko Groq par mat bhejo
-      const lastUserMsg = extractLastUserText(body.messages || []);
+      // 1. Background title/ping calls ko Groq par mat bhejo (0 tokens spent)
+      const lastMsg = body.messages?.[body.messages.length - 1];
+      const rawText = extractText(lastMsg?.content);
       if (
-        lastUserMsg.includes("Please write a 5-10 word title") ||
-        lastUserMsg.includes("Generate a concise title") ||
-        lastUserMsg.includes("is_error") && lastUserMsg.length < 150
+        rawText.includes("Please write a 5-10 word title") ||
+        rawText.includes("Generate a concise title")
       ) {
-        return buildAnthropicReply("Task", body.stream, body.model);
+        return buildAnthropicReply({ text: "Coding Task" }, body.stream, body.model);
       }
 
-      // 4. STRICT 500-TOKEN HARD CAP (~1800 characters max total payload)
-      const MAX_TOTAL_CHARS = 1800; // ~450-500 tokens max
-      const compactSystem = "You are a concise coding assistant. Give short, direct code answers.";
-      
-      // Sirf aakhiri user message aur zaroori context rakhein
-      let trimmedUserText = lastUserMsg.slice(-1400); // Max ~350 tokens user prompt
-      if (!trimmedUserText.trim()) trimmedUserText = "Hello";
-
+      // 2. Sirf aakhiri 2 messages rakhein (History trim taaki tokens < 600 rahein)
+      const recentMsgs = (body.messages || []).slice(-2);
       const groqMessages = [
-        { role: "system", content: compactSystem },
-        { role: "user", content: trimmedUserText },
+        {
+          role: "system",
+          content: "You are Claude Code. Use tools (Write, Edit, Bash, Read) directly to modify files. Be concise.",
+        },
       ];
 
-      // Total safety check: agar abhi bhi 1800 chars se zyada ho toh kaat dein
-      const totalChars = JSON.stringify(groqMessages).length;
-      if (totalChars > MAX_TOTAL_CHARS) {
-        groqMessages[1].content = groqMessages[1].content.slice(-1200);
+      for (const m of recentMsgs) {
+        const mapped = mapAnthropicToGroqMsg(m);
+        if (mapped) groqMessages.push(mapped);
       }
 
-      // 5. Primary & Fallback Models (High TPM on Groq)
+      // 3. Ultra-Compact Core Tools (Sirf 4 zaroori tools, ~220 tokens total)
+      const compactTools = [
+        {
+          type: "function",
+          function: {
+            name: "Write",
+            description: "Write full content to a file",
+            parameters: {
+              type: "object",
+              properties: {
+                file_path: { type: "string" },
+                content: { type: "string" },
+              },
+              required: ["file_path", "content"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "Edit",
+            description: "Replace string in a file",
+            parameters: {
+              type: "object",
+              properties: {
+                file_path: { type: "string" },
+                old_string: { type: "string" },
+                new_string: { type: "string" },
+              },
+              required: ["file_path", "old_string", "new_string"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "Read",
+            description: "Read a file",
+            parameters: {
+              type: "object",
+              properties: { file_path: { type: "string" } },
+              required: ["file_path"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "Bash",
+            description: "Run shell command",
+            parameters: {
+              type: "object",
+              properties: { command: { type: "string" } },
+              required: ["command"],
+            },
+          },
+        },
+      ];
+
+      // 4. High-TPM Groq Models (30,000 TPM limit on llama-3.3-70b / 8b)
       const primaryModel = request.headers.get("X-Target-Model") || env.TARGET_MODEL || "llama-3.3-70b-versatile";
       const fallbackModel = "llama-3.1-8b-instant";
 
-      let groqRes = await callGroq(apiKey, primaryModel, groqMessages);
-
-      // Agar primary model par 429 ya error aaye toh turant 8b-instant par fallback karein
+      let groqRes = await callGroq(apiKey, primaryModel, groqMessages, compactTools);
       if (!groqRes.ok) {
-        groqRes = await callGroq(apiKey, fallbackModel, groqMessages);
+        groqRes = await callGroq(apiKey, fallbackModel, groqMessages, compactTools);
       }
 
       if (!groqRes.ok) {
         const errText = await groqRes.text();
-        return anthropicError(`Groq Error (${groqRes.status}): ${errText.slice(0, 200)}`, groqRes.status);
+        return anthropicError(`Groq Error (${groqRes.status}): ${errText.slice(0, 180)}`, groqRes.status);
       }
 
       const groqData = await groqRes.json();
-      const replyText = groqData.choices?.[0]?.message?.content || "Done.";
+      const choice = groqData.choices?.[0]?.message || {};
 
-      return buildAnthropicReply(replyText, body.stream, body.model);
+      return buildAnthropicReply(
+        {
+          text: choice.content || "",
+          toolCalls: choice.tool_calls || [],
+        },
+        body.stream,
+        body.model
+      );
     } catch (err) {
-      return anthropicError(`Proxy Exception: ${err.message}`, 500);
+      return anthropicError(`Proxy Error: ${err.message}`, 500);
     }
   },
 };
 
-// --- Helper Functions ---
+// --- Helpers ---
 
-async function callGroq(apiKey, model, messages) {
+async function callGroq(apiKey, model, messages, tools) {
   return fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -112,44 +167,125 @@ async function callGroq(apiKey, model, messages) {
     body: JSON.stringify({
       model,
       messages,
-      max_tokens: 512,
-      temperature: 0.2,
+      tools,
+      tool_choice: "auto",
+      max_tokens: 1024,
+      temperature: 0.1,
     }),
   });
 }
 
-function extractLastUserText(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
-      const content = messages[i].content;
-      if (typeof content === "string") return content;
-      if (Array.isArray(content)) {
-        return content
-          .filter((c) => c.type === "text" && c.text)
-          .map((c) => c.text)
-          .join("\n");
-      }
-    }
+function extractText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((c) => c.text || c.content || "").join("\n");
   }
   return "";
 }
 
-function buildAnthropicReply(text, isStream, modelName) {
+function mapAnthropicToGroqMsg(msg) {
+  const role = msg.role === "assistant" ? "assistant" : "user";
+  const content = msg.content;
+
+  if (typeof content === "string") {
+    return { role, content: content.slice(-1200) };
+  }
+
+  if (Array.isArray(content)) {
+    // Handle tool_result from Claude Code
+    const toolRes = content.find((c) => c.type === "tool_result");
+    if (toolRes) {
+      const out = typeof toolRes.content === "string" ? toolRes.content : JSON.stringify(toolRes.content);
+      return {
+        role: "tool",
+        tool_call_id: toolRes.tool_use_id || "call_1",
+        content: out.slice(0, 800),
+      };
+    }
+
+    // Handle assistant tool_use history
+    const toolUse = content.find((c) => c.type === "tool_use");
+    if (toolUse && role === "assistant") {
+      return {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: toolUse.id,
+            type: "function",
+            function: {
+              name: toolUse.name,
+              arguments: JSON.stringify(toolUse.input || {}),
+            },
+          },
+        ],
+      };
+    }
+
+    const text = content
+      .filter((c) => c.type === "text" && c.text)
+      .map((c) => c.text)
+      .join("\n")
+      .slice(-1200);
+    if (text) return { role, content: text };
+  }
+  return null;
+}
+
+function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
   const id = "msg_" + Date.now();
   const model = modelName || "claude-3-5-sonnet-20241022";
+  const contentBlocks = [];
+
+  if (text) {
+    contentBlocks.push({ type: "text", text });
+  }
+
+  for (const tc of toolCalls) {
+    let parsedArgs = {};
+    try {
+      parsedArgs = JSON.parse(tc.function.arguments || "{}");
+    } catch {
+      parsedArgs = {};
+    }
+    contentBlocks.push({
+      type: "tool_use",
+      id: tc.id || "toolu_" + Date.now(),
+      name: tc.function.name,
+      input: parsedArgs,
+    });
+  }
+
+  if (contentBlocks.length === 0) {
+    contentBlocks.push({ type: "text", text: "Done." });
+  }
+
+  const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn";
 
   if (isStream) {
     const encoder = new TextEncoder();
-    const events = [
-      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id, type: "message", role: "assistant", content: [], model, stop_reason: null, usage: { input_tokens: 350, output_tokens: 1 } } })}\n\n`,
-      `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
-      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`,
-      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
-      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 100 } })}\n\n`,
-      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
-    ].join("");
+    let sse = `event: message_start\ndata: ${JSON.stringify({
+      type: "message_start",
+      message: { id, type: "message", role: "assistant", content: [], model, stop_reason: null, usage: { input_tokens: 450, output_tokens: 1 } },
+    })}\n\n`;
 
-    return new Response(encoder.encode(events), {
+    contentBlocks.forEach((block, idx) => {
+      if (block.type === "text") {
+        sse += `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: idx, content_block: { type: "text", text: "" } })}\n\n`;
+        sse += `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: idx, delta: { type: "text_delta", text: block.text } })}\n\n`;
+        sse += `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: idx })}\n\n`;
+      } else if (block.type === "tool_use") {
+        sse += `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: block.id, name: block.name, input: {} } })}\n\n`;
+        sse += `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } })}\n\n`;
+        sse += `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: idx })}\n\n`;
+      }
+    });
+
+    sse += `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 150 } })}\n\n`;
+    sse += `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
+
+    return new Response(encoder.encode(sse), {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -163,28 +299,19 @@ function buildAnthropicReply(text, isStream, modelName) {
     type: "message",
     role: "assistant",
     model,
-    content: [{ type: "text", text }],
-    stop_reason: "end_turn",
-    usage: { input_tokens: 350, output_tokens: 100 },
+    content: contentBlocks,
+    stop_reason: stopReason,
+    usage: { input_tokens: 450, output_tokens: 150 },
   });
 }
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
 }
 
 function anthropicError(message, status = 400) {
-  return jsonResponse(
-    {
-      type: "error",
-      error: { type: "api_error", message },
-    },
-    status
-  );
+  return jsonResponse({ type: "error", error: { type: "api_error", message } }, status);
 }
