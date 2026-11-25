@@ -2,6 +2,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -12,17 +13,32 @@ export default {
       });
     }
 
-    if (url.pathname.endsWith("/v1/models")) {
+    // 2. Model Validation Fix (/v1/models aur /v1/models/<any-id> dono handle karega)
+    if (url.pathname.includes("/v1/models")) {
+      const parts = url.pathname.split("/v1/models/");
+      if (parts[1]) {
+        return jsonResponse({
+          id: decodeURIComponent(parts[1]),
+          object: "model",
+          created: 1730000000,
+          owned_by: "anthropic",
+        });
+      }
       return jsonResponse({
         object: "list",
         data: [
+          { id: "claude-sonnet-4-5-20250929", object: "model", created: 1730000000, owned_by: "anthropic" },
+          { id: "claude-sonnet-4-20250514", object: "model", created: 1730000000, owned_by: "anthropic" },
+          { id: "claude-haiku-4-5-20251001", object: "model", created: 1730000000, owned_by: "anthropic" },
+          { id: "claude-3-7-sonnet-20250219", object: "model", created: 1730000000, owned_by: "anthropic" },
           { id: "claude-3-5-sonnet-20241022", object: "model", created: 1700000000, owned_by: "anthropic" },
           { id: "claude-3-5-haiku-20241022", object: "model", created: 1700000000, owned_by: "anthropic" },
         ],
       });
     }
 
-    if (url.pathname.endsWith("/count_tokens")) {
+    // 3. Token Counter Bypass (Zero Groq API call)
+    if (url.pathname.includes("/count_tokens")) {
       return jsonResponse({ input_tokens: 450 });
     }
 
@@ -38,14 +54,14 @@ export default {
         (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
 
       if (!apiKey) {
-        return anthropicError("GROQ_API_KEY missing.", 401);
+        return anthropicError("GROQ_API_KEY missing in Worker secrets or headers.", 401);
       }
 
-      // 1. COMPLETE BACKGROUND NOISE BLOCKER (System + User dono check karega)
+      // 4. Complete Background Noise Blocker (System + User dono check karega)
       const sysText = extractText(body.system).toLowerCase();
       const lastMsg = body.messages?.[body.messages.length - 1];
       const rawText = extractText(lastMsg?.content);
-      const lowerRaw = rawText.toLowerCase();
+      const lowerRaw = rawText.toLowerCase().trim();
 
       if (
         sysText.includes("5-10 word title") ||
@@ -53,17 +69,18 @@ export default {
         sysText.includes("summarize this coding session") ||
         lowerRaw.includes("please write a 5-10 word title") ||
         lowerRaw.includes("generate a concise title") ||
-        (lowerRaw.trim() === "ping" || lowerRaw.trim() === "test")
+        lowerRaw === "ping" ||
+        lowerRaw === "test"
       ) {
         return buildAnthropicReply({ text: "Coding Session" }, body.stream, body.model);
       }
 
-      // 2. STRICT 500-TOKEN PAYLOAD TRIMMER
+      // 5. Strict ~500-Token Payload Trimmer (Sirf aakhiri 2 messages)
       const recentMsgs = (body.messages || []).slice(-2);
       const groqMessages = [
         {
           role: "system",
-          content: "You are Claude Code. Use Write, Edit, Read, Bash tools directly on files. Keep replies short.",
+          content: "You are Claude Code. Use Write, Edit, Read, Bash tools directly on files. Keep replies concise.",
         },
       ];
 
@@ -72,13 +89,13 @@ export default {
         if (mapped) groqMessages.push(mapped);
       }
 
-      // 3. Compact Tools (~220 tokens total, taaki auto file edit chalta rahe)
+      // 6. Compact Core Tools (~220 tokens total, taaki auto file edit/create chalta rahe)
       const compactTools = [
         {
           type: "function",
           function: {
             name: "Write",
-            description: "Write content to file",
+            description: "Write content to a file",
             parameters: {
               type: "object",
               properties: {
@@ -93,7 +110,7 @@ export default {
           type: "function",
           function: {
             name: "Edit",
-            description: "Replace exact text in file",
+            description: "Replace exact text in a file",
             parameters: {
               type: "object",
               properties: {
@@ -121,7 +138,7 @@ export default {
           type: "function",
           function: {
             name: "Bash",
-            description: "Execute shell command",
+            description: "Run shell command",
             parameters: {
               type: "object",
               properties: { command: { type: "string" } },
@@ -131,7 +148,7 @@ export default {
         },
       ];
 
-      // 4. SMART MODEL ROUTING (Haiku/Background -> 8B Fast Model, Main -> 70B/Custom)
+      // 7. Smart Model Routing & Auto-Fallback (High-TPM Groq Models)
       const reqModel = (body.model || "").toLowerCase();
       const isBackgroundModel = reqModel.includes("haiku");
       const mainModel = request.headers.get("X-Target-Model") || env.TARGET_MODEL || "llama-3.3-70b-versatile";
@@ -141,7 +158,7 @@ export default {
 
       let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools);
 
-      // Agar main model 429 ya error de toh turant fastModel par fallback karein
+      // Agar primary model par 429 ya error aaye toh turant fastModel par fallback karein
       if (!groqRes.ok && chosenModel !== fastModel) {
         groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools);
       }
@@ -168,7 +185,7 @@ export default {
   },
 };
 
-// --- Helpers ---
+// --- Helper Functions ---
 
 async function callGroq(apiKey, model, messages, tools) {
   return fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -278,22 +295,56 @@ function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
     const encoder = new TextEncoder();
     let sse = `event: message_start\ndata: ${JSON.stringify({
       type: "message_start",
-      message: { id, type: "message", role: "assistant", content: [], model, stop_reason: null, usage: { input_tokens: 450, output_tokens: 1 } },
+      message: {
+        id,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model,
+        stop_reason: null,
+        usage: { input_tokens: 450, output_tokens: 1 },
+      },
     })}\n\n`;
 
     contentBlocks.forEach((block, idx) => {
       if (block.type === "text") {
-        sse += `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: idx, content_block: { type: "text", text: "" } })}\n\n`;
-        sse += `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: idx, delta: { type: "text_delta", text: block.text } })}\n\n`;
-        sse += `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: idx })}\n\n`;
+        sse += `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: idx,
+          content_block: { type: "text", text: "" },
+        })}\n\n`;
+        sse += `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "text_delta", text: block.text },
+        })}\n\n`;
+        sse += `event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop",
+          index: idx,
+        })}\n\n`;
       } else if (block.type === "tool_use") {
-        sse += `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: block.id, name: block.name, input: {} } })}\n\n`;
-        sse += `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } })}\n\n`;
-        sse += `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: idx })}\n\n`;
+        sse += `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: idx,
+          content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+        })}\n\n`;
+        sse += `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
+        })}\n\n`;
+        sse += `event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop",
+          index: idx,
+        })}\n\n`;
       }
     });
 
-    sse += `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 150 } })}\n\n`;
+    sse += `event: message_delta\ndata: ${JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: 150 },
+    })}\n\n`;
     sse += `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
 
     return new Response(encoder.encode(sse), {
