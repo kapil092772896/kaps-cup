@@ -7,57 +7,60 @@ export default {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
           "Access-Control-Allow-Headers": "*",
         },
       });
     }
 
-    // 2. Model Validation Fix (/v1/models aur /v1/models/<any-id> dono handle karega)
+    // 2. Exact Anthropic /v1/models & /v1/models/:id Response (Fixes "model may not exist" error)
     if (url.pathname.includes("/v1/models")) {
       const parts = url.pathname.split("/v1/models/");
       if (parts[1]) {
+        const modelId = decodeURIComponent(parts[1]).replace(/\/+$/, "");
         return jsonResponse({
-          id: decodeURIComponent(parts[1]),
-          object: "model",
-          created: 1730000000,
-          owned_by: "anthropic",
+          type: "model",
+          id: modelId,
+          display_name: modelId,
+          created_at: "2024-10-22T00:00:00Z",
         });
       }
       return jsonResponse({
-        object: "list",
         data: [
-          { id: "claude-sonnet-4-5-20250929", object: "model", created: 1730000000, owned_by: "anthropic" },
-          { id: "claude-sonnet-4-20250514", object: "model", created: 1730000000, owned_by: "anthropic" },
-          { id: "claude-haiku-4-5-20251001", object: "model", created: 1730000000, owned_by: "anthropic" },
-          { id: "claude-3-7-sonnet-20250219", object: "model", created: 1730000000, owned_by: "anthropic" },
-          { id: "claude-3-5-sonnet-20241022", object: "model", created: 1700000000, owned_by: "anthropic" },
-          { id: "claude-3-5-haiku-20241022", object: "model", created: 1700000000, owned_by: "anthropic" },
+          { type: "model", id: "claude-3-5-sonnet-20241022", display_name: "Claude 3.5 Sonnet", created_at: "2024-10-22T00:00:00Z" },
+          { type: "model", id: "claude-3-5-haiku-20241022", display_name: "Claude 3.5 Haiku", created_at: "2024-10-22T00:00:00Z" },
+          { type: "model", id: "claude-sonnet-4-5-20250929", display_name: "Claude Sonnet 4.5", created_at: "2025-09-29T00:00:00Z" },
+          { type: "model", id: "claude-haiku-4-5-20251001", display_name: "Claude Haiku 4.5", created_at: "2025-10-01T00:00:00Z" },
         ],
+        has_more: false,
+        first_id: "claude-3-5-sonnet-20241022",
+        last_id: "claude-haiku-4-5-20251001",
       });
     }
 
-    // 3. Token Counter Bypass (Zero Groq API call)
+    // 3. Token Counter Bypass (/v1/messages/count_tokens)
     if (url.pathname.includes("/count_tokens")) {
       return jsonResponse({ input_tokens: 450 });
     }
 
     if (request.method !== "POST") {
-      return new Response("Worker Active", { status: 200 });
+      return new Response("OK", { status: 200 });
     }
 
     try {
       const body = await request.json();
+      const requestedModel = body.model || "claude-3-5-sonnet-20241022";
+
       const apiKey =
         env.GROQ_API_KEY ||
         request.headers.get("x-api-key") ||
         (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
 
       if (!apiKey) {
-        return anthropicError("GROQ_API_KEY missing in Worker secrets or headers.", 401);
+        return anthropicError("GROQ_API_KEY missing in Worker secrets.", 401);
       }
 
-      // 4. Complete Background Noise Blocker (System + User dono check karega)
+      // 4. Background Noise Blocker (Title generation, session summary, ping -> 0 Groq tokens)
       const sysText = extractText(body.system).toLowerCase();
       const lastMsg = body.messages?.[body.messages.length - 1];
       const rawText = extractText(lastMsg?.content);
@@ -72,15 +75,15 @@ export default {
         lowerRaw === "ping" ||
         lowerRaw === "test"
       ) {
-        return buildAnthropicReply({ text: "Coding Session" }, body.stream, body.model);
+        return buildAnthropicReply({ text: "Coding Task" }, body.stream, requestedModel);
       }
 
-      // 5. Strict ~500-Token Payload Trimmer (Sirf aakhiri 2 messages)
+      // 5. Strict ~500-Token Payload Trimmer
       const recentMsgs = (body.messages || []).slice(-2);
       const groqMessages = [
         {
           role: "system",
-          content: "You are Claude Code. Use Write, Edit, Read, Bash tools directly on files. Keep replies concise.",
+          content: "You are Claude Code. Use Write, Edit, Read, Bash tools directly on files. Keep responses brief.",
         },
       ];
 
@@ -89,7 +92,7 @@ export default {
         if (mapped) groqMessages.push(mapped);
       }
 
-      // 6. Compact Core Tools (~220 tokens total, taaki auto file edit/create chalta rahe)
+      // 6. Compact Core Tools (~220 tokens total)
       const compactTools = [
         {
           type: "function",
@@ -148,24 +151,21 @@ export default {
         },
       ];
 
-      // 7. Smart Model Routing & Auto-Fallback (High-TPM Groq Models)
-      const reqModel = (body.model || "").toLowerCase();
-      const isBackgroundModel = reqModel.includes("haiku");
+      // 7. Smart Model Routing & Auto-Fallback
+      const isBackgroundModel = requestedModel.toLowerCase().includes("haiku");
       const mainModel = request.headers.get("X-Target-Model") || env.TARGET_MODEL || "llama-3.3-70b-versatile";
       const fastModel = "llama-3.1-8b-instant";
-
       const chosenModel = isBackgroundModel ? fastModel : mainModel;
 
       let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools);
 
-      // Agar primary model par 429 ya error aaye toh turant fastModel par fallback karein
       if (!groqRes.ok && chosenModel !== fastModel) {
         groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools);
       }
 
       if (!groqRes.ok) {
         const errText = await groqRes.text();
-        return anthropicError(`Groq Error (${groqRes.status}): ${errText.slice(0, 180)}`, groqRes.status);
+        return anthropicError(`Groq (${groqRes.status}): ${errText.slice(0, 180)}`, 502);
       }
 
       const groqData = await groqRes.json();
@@ -177,7 +177,7 @@ export default {
           toolCalls: choice.tool_calls || [],
         },
         body.stream,
-        body.model
+        requestedModel
       );
     } catch (err) {
       return anthropicError(`Proxy Error: ${err.message}`, 500);
@@ -185,7 +185,7 @@ export default {
   },
 };
 
-// --- Helper Functions ---
+// --- Helpers ---
 
 async function callGroq(apiKey, model, messages, tools) {
   return fetch("https://api.groq.com/openai/v1/chat/completions", {
