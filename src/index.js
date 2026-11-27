@@ -13,7 +13,7 @@ export default {
       });
     }
 
-    // 2. Exact Anthropic /v1/models & /v1/models/:id Response
+    // 2. Anthropic /v1/models & /v1/models/:id Validation
     if (url.pathname.includes("/v1/models")) {
       const parts = url.pathname.split("/v1/models/");
       if (parts[1]) {
@@ -40,7 +40,7 @@ export default {
 
     // 3. Token Counter Bypass
     if (url.pathname.includes("/count_tokens")) {
-      return jsonResponse({ input_tokens: 600 });
+      return jsonResponse({ input_tokens: 550 });
     }
 
     if (request.method !== "POST") {
@@ -60,7 +60,7 @@ export default {
         return anthropicError("GROQ_API_KEY missing in Worker secrets.", 401);
       }
 
-      // 4. Background Noise Blocker (0 Groq tokens)
+      // 4. Background Noise Blocker (Title generation, summary, ping -> 0 Groq tokens)
       const rawSysText = extractText(body.system);
       const sysTextLower = rawSysText.toLowerCase();
       const allMsgs = body.messages || [];
@@ -80,170 +80,222 @@ export default {
         return buildAnthropicReply({ text: "Coding Task" }, body.stream, requestedModel);
       }
 
-      // 5. ACTIVE PROJECT & WORKSPACE DETECTOR
+      // 5. Project & Workspace Detection
       const projectInfo = detectActiveProject(rawSysText, allMsgs);
       const activeProjectName = projectInfo.name;
       const activeProjectRoot = projectInfo.root;
-      const isWorkspaceRoot = /^(project|projects|htdocs|www)$/i.test(activeProjectName);
+      const isWorkspaceParent = /^(project|projects|htdocs|www)$/i.test(activeProjectName);
 
-      const memoryFilePath = activeProjectRoot
-        ? `${activeProjectRoot.replace(/[\\/]+$/, "")}/PROJECT_MEMORY.md`
-        : "PROJECT_MEMORY.md";
-
-      // 6. CLEAN STATE TRACKER (Ignores <system-reminder> and tool_result noise)
-      let startIdx = 0;
-      if (activeProjectName !== "default") {
-        for (let i = allMsgs.length - 1; i >= 0; i--) {
-          const msgStr = JSON.stringify(allMsgs[i]);
-          if (msgStr.includes("Working directory:") && !msgStr.toLowerCase().includes(activeProjectName.toLowerCase())) {
-            startIdx = i + 1;
-            break;
-          }
-        }
-      }
-
-      const activeMsgs = allMsgs.slice(startIdx);
+      // 6. Full Session State Analysis (Clean, Ignores <system-reminder>)
       const readFiles = new Set();
       const modifiedFiles = new Set();
       const ranCommands = new Set();
       const cleanUserPrompts = [];
+      let lastUserIdx = 0;
 
-      let memoryReadEver = false;
-      let memoryMissing = false;
-      let memoryCreatedOrUpdatedThisTurn = false;
-      let realWorkDoneThisTurn = 0;
-      let lastUserTurnIdx = 0;
-
-      for (let i = 0; i < activeMsgs.length; i++) {
-        const m = activeMsgs[i];
-        if (m.role === "user") {
-          const pureText = extractPureUserPrompt(m.content);
-          if (pureText) {
-            cleanUserPrompts.push(pureText);
-            lastUserTurnIdx = i;
+      for (let i = 0; i < allMsgs.length; i++) {
+        if (allMsgs[i].role === "user") {
+          const pure = extractPureUserPrompt(allMsgs[i].content);
+          if (pure) {
+            cleanUserPrompts.push(pure);
+            lastUserIdx = i;
           }
         }
       }
 
-      for (let i = 0; i < activeMsgs.length; i++) {
-        const m = activeMsgs[i];
-        const isCurrentTurn = i >= lastUserTurnIdx;
+      let detectedSubProject = "";
+      let hasPromptTxt = false;
+      let promptTxtRead = false;
+      let memoryChecked = false;
+      let memoryMissing = false;
+      let memoryUpdatedThisTurn = false;
+      let codeWorkThisTurn = 0;
+      let bashWorkThisTurn = 0;
 
+      for (let i = 0; i < allMsgs.length; i++) {
+        const m = allMsgs[i];
+        const isCurrentTurn = i >= lastUserIdx;
+
+        // Inspect tool_results for directory listings, prompt.txt, or missing PROJECT_MEMORY.md
         if (m.role === "user" && Array.isArray(m.content)) {
           for (const block of m.content) {
             if (block.type === "tool_result") {
-              const resStr = (typeof block.content === "string" ? block.content : JSON.stringify(block.content)).toLowerCase();
+              const resStr = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+              const lowerRes = resStr.toLowerCase();
+
+              if (lowerRes.includes("prompt.txt")) {
+                hasPromptTxt = true;
+              }
               if (
-                memoryReadEver &&
-                !memoryCreatedOrUpdatedThisTurn &&
-                (resStr.includes("does not exist") || resStr.includes("no such file") || resStr.includes("enoent"))
+                memoryChecked &&
+                !memoryUpdatedThisTurn &&
+                (lowerRes.includes("does not exist") || lowerRes.includes("no such file") || lowerRes.includes("enoent"))
               ) {
                 memoryMissing = true;
+              }
+              // Agar workspace parent mein ls chala toh subfolder name pakdein (e.g., AI-Shop-Platform/)
+              if (isWorkspaceParent && !detectedSubProject) {
+                const dirMatch = resStr.match(/([A-Za-z0-9._-]+)\//);
+                if (dirMatch && !/^(node_modules|\.git|\.claude)$/i.test(dirMatch[1])) {
+                  detectedSubProject = dirMatch[1];
+                }
               }
             }
           }
         }
 
+        // Inspect assistant tool_use history
         if (m.role === "assistant" && Array.isArray(m.content)) {
           for (const block of m.content) {
             if (block.type === "tool_use") {
               const rawFp = (block.input?.file_path || "").replace(/\\/g, "/");
               const normFp = rawFp.toLowerCase();
-              const isMemFile = normFp.endsWith("project_memory.md");
+              const isMem = normFp.endsWith("project_memory.md");
 
               if (block.name === "Read" && normFp) {
-                if (isMemFile) {
-                  memoryReadEver = true;
+                if (isMem) {
+                  memoryChecked = true;
                 } else {
                   readFiles.add(normFp);
-                  if (isCurrentTurn) realWorkDoneThisTurn++;
+                  if (normFp.endsWith("prompt.txt")) promptTxtRead = true;
+                  if (isCurrentTurn) codeWorkThisTurn++;
                 }
               } else if ((block.name === "Edit" || block.name === "Write") && normFp) {
-                if (isMemFile) {
+                if (isMem) {
                   memoryMissing = false;
-                  memoryReadEver = true;
-                  if (isCurrentTurn) memoryCreatedOrUpdatedThisTurn = true;
+                  memoryChecked = true;
+                  if (isCurrentTurn) memoryUpdatedThisTurn = true;
                 } else {
                   modifiedFiles.add(`${block.name}:${rawFp}`);
                   if (isCurrentTurn) {
-                    realWorkDoneThisTurn++;
-                    memoryCreatedOrUpdatedThisTurn = false;
+                    codeWorkThisTurn++;
+                    memoryUpdatedThisTurn = false;
                   }
                 }
               } else if (block.name === "Bash" && block.input?.command) {
                 ranCommands.add(block.input.command.trim());
-                if (isCurrentTurn) realWorkDoneThisTurn++;
+                if (isCurrentTurn) bashWorkThisTurn++;
               }
             }
           }
         }
       }
 
-      const latestUserPrompt = cleanUserPrompts[cleanUserPrompts.length - 1] || "Check UI and run project";
+      // Resolve final target folder & memory path
+      const targetProjectName = detectedSubProject || activeProjectName;
+      const targetRoot =
+        detectedSubProject && activeProjectRoot
+          ? `${activeProjectRoot.replace(/[\\/]+$/, "")}/${detectedSubProject}`
+          : activeProjectRoot;
 
-      // 7. DIRECT EXECUTION PIPELINE
-      let workflowInstruction = "";
-      let forceToolChoice = "auto";
+      const memoryFilePath = targetRoot
+        ? `${targetRoot.replace(/[\\/]+$/, "")}/PROJECT_MEMORY.md`
+        : "PROJECT_MEMORY.md";
 
-      if (isWorkspaceRoot && ranCommands.size === 0) {
-        // User d:\project mein hai -> Pehle subfolders detect karo
-        workflowInstruction =
-          `Current directory is workspace root "${activeProjectRoot || "d:/project"}". ` +
-          `First call Bash with "ls -d */" to find the project folder (e.g. AI-Shop-Platform), then inspect and run it.`;
-        forceToolChoice = "required";
-      } else if (memoryMissing && !memoryCreatedOrUpdatedThisTurn) {
-        // PROJECT_MEMORY.md nahi mili -> Ek hi turn mein Write se memory banao + project check/run karo
-        workflowInstruction =
-          `"${memoryFilePath}" does not exist. Call Write ONCE to create "${memoryFilePath}" with clean markdown:\n` +
-          `# Project: ${activeProjectName}\n\n## Completed Tasks\n- Initialized memory\n\n## Pending Tasks\n- ${latestUserPrompt}\n\n## Recent Changes\n- Created PROJECT_MEMORY.md\n` +
-          `AND in the same turn, start executing the user's request ("${latestUserPrompt}") using Read or Bash.`;
-        forceToolChoice = "required";
-      } else if (!memoryReadEver) {
-        workflowInstruction =
-          `Call Read ONCE on "${memoryFilePath}" AND also start checking/running the project for: "${latestUserPrompt}".`;
-        forceToolChoice = "required";
-      } else if (realWorkDoneThisTurn === 0) {
-        // Abhi tak koi asli kaam (UI check / file edit / server run) nahi hua -> Force execute!
-        workflowInstruction =
-          `DO NOT stop or rewrite PROJECT_MEMORY.md yet! Execute the user's request ("${latestUserPrompt}") right now: ` +
-          `1) Check UI files (index.php/index.html/src) using Read (never re-read [${Array.from(readFiles).join(", ")}]). ` +
-          `2) Fix any UI issues if found, and run/verify the project using Bash (e.g., php -S localhost:8000 or npm run dev or checking XAMPP).`;
-        forceToolChoice = "required";
-      } else if (modifiedFiles.size > 0 && !memoryCreatedOrUpdatedThisTurn) {
-        workflowInstruction =
-          `Code updated (${Array.from(modifiedFiles).slice(-3).join(", ")}). Update "${memoryFilePath}" once with what was fixed/run, then give final summary.`;
-        forceToolChoice = "required";
+      const promptTxtPath = targetRoot
+        ? `${targetRoot.replace(/[\\/]+$/, "")}/prompt.txt`
+        : "prompt.txt";
+
+      const latestUserPrompt = cleanUserPrompts[cleanUserPrompts.length - 1] || "Build and run the project";
+
+      // 7. Step-by-Step Non-Stopping Execution Plan
+      let stepInstruction = "";
+      let toolChoiceMode = "auto";
+
+      if (isWorkspaceParent && !detectedSubProject && ranCommands.size === 0) {
+        stepInstruction =
+          `You are in parent folder "${activeProjectRoot || "d:/project"}". Run Bash with "ls -d */" to locate the active project folder.`;
+        toolChoiceMode = "required";
+      } else if (memoryMissing && !memoryUpdatedThisTurn) {
+        stepInstruction =
+          `Create "${memoryFilePath}" using Write with:\n` +
+          `# Project: ${targetProjectName}\n\n## Completed Tasks\n- Initialized project memory\n\n## Pending Tasks\n- ${latestUserPrompt}\n\n## Recent Changes\n- Created PROJECT_MEMORY.md\n` +
+          `Also check "${targetRoot || "."}" files using Bash ("ls -la ${targetRoot || "."}") in the same turn.`;
+        toolChoiceMode = "required";
+      } else if (!memoryChecked) {
+        stepInstruction =
+          `Read "${memoryFilePath}" using Read (only once) and list files in "${targetRoot || "."}" using Bash ("ls -la ${targetRoot || "."}").`;
+        toolChoiceMode = "required";
+      } else if (hasPromptTxt && !promptTxtRead) {
+        stepInstruction =
+          `Read "${promptTxtPath}" ONCE using Read to understand full project specifications, then start building/updating the project.`;
+        toolChoiceMode = "required";
+      } else if (codeWorkThisTurn === 0 && bashWorkThisTurn === 0) {
+        stepInstruction =
+          `Execute the user's request ("${latestUserPrompt}") inside "${targetRoot || targetProjectName}" right now! ` +
+          `Use Write/Edit to build or fix UI/code files, or Bash to test/run the server (e.g. php -S localhost:8000 or npm run dev). ` +
+          `Do NOT re-read: [${Array.from(readFiles).join(", ")}, project_memory.md].`;
+        toolChoiceMode = "required";
+      } else if (modifiedFiles.size > 0 && !memoryUpdatedThisTurn) {
+        stepInstruction =
+          `Update "${memoryFilePath}" using Write or Edit to log completed changes (${Array.from(modifiedFiles).slice(-4).join(", ")}) and remaining pending tasks.`;
+        toolChoiceMode = "required";
       } else {
-        workflowInstruction =
-          `Task completed in "${activeProjectName}". Summarize what was checked, fixed, and how the project is running (including local URL/port if started).`;
-        forceToolChoice = "auto";
+        stepInstruction =
+          `Summarize clearly in 2-3 lines what files were created/updated, what was run/verified in "${targetProjectName}", and any local URL if started.`;
+        toolChoiceMode = "auto";
       }
 
-      // 8. Build Compact Context (~580 tokens max)
+      // 8. Compact Messages Payload (~550-650 tokens)
       const groqMessages = [
         {
           role: "system",
           content:
-            `You are Claude Code working in "${activeProjectName}" (Root: "${activeProjectRoot || "."}"). Never stop until the user's actual task is executed.\n` +
-            workflowInstruction,
+            `You are Claude Code working in project "${targetProjectName}" (Path: "${targetRoot || "."}"). ` +
+            `Work efficiently: execute multiple file operations in parallel, never repeat Read/ls commands, and always update PROJECT_MEMORY.md after edits.\n` +
+            stepInstruction,
         },
         {
           role: "user",
-          content: `USER REQUEST: ${latestUserPrompt}`,
+          content: `CURRENT REQUEST: ${latestUserPrompt}`,
         },
       ];
 
-      // Aakhiri 2 messages add karein (tool calls & outputs)
-      const recentMsgs = activeMsgs.slice(-2);
+      // Convert last 2 messages properly (preserving ALL parallel tool_uses and tool_results)
+      const recentMsgs = allMsgs.slice(-2);
       for (const m of recentMsgs) {
-        const mapped = mapAnthropicToGroqMsg(m);
-        if (mapped && mapped.role !== "user") {
-          groqMessages.push(mapped);
+        const mappedList = mapAnthropicToGroqMessages(m);
+        for (const item of mappedList) {
+          if (item.role === "user" && item.content.includes(latestUserPrompt.slice(0, 50))) {
+            continue;
+          }
+          groqMessages.push(item);
         }
       }
 
-      // 9. Compact Tools
+      // 9. Compact Core Tools
       const compactTools = [
+        {
+          type: "function",
+          function: {
+            name: "Write",
+            description: "Create or overwrite a file with complete code",
+            parameters: {
+              type: "object",
+              properties: {
+                file_path: { type: "string" },
+                content: { type: "string" },
+              },
+              required: ["file_path", "content"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "Edit",
+            description: "Replace exact string in an existing file",
+            parameters: {
+              type: "object",
+              properties: {
+                file_path: { type: "string" },
+                old_string: { type: "string" },
+                new_string: { type: "string" },
+              },
+              required: ["file_path", "old_string", "new_string"],
+            },
+          },
+        },
         {
           type: "function",
           function: {
@@ -259,39 +311,8 @@ export default {
         {
           type: "function",
           function: {
-            name: "Write",
-            description: "Create or overwrite a file",
-            parameters: {
-              type: "object",
-              properties: {
-                file_path: { type: "string" },
-                content: { type: "string" },
-              },
-              required: ["file_path", "content"],
-            },
-          },
-        },
-        {
-          type: "function",
-          function: {
-            name: "Edit",
-            description: "Replace exact text in a file",
-            parameters: {
-              type: "object",
-              properties: {
-                file_path: { type: "string" },
-                old_string: { type: "string" },
-                new_string: { type: "string" },
-              },
-              required: ["file_path", "old_string", "new_string"],
-            },
-          },
-        },
-        {
-          type: "function",
-          function: {
             name: "Bash",
-            description: "Run shell command (check files, start PHP/Node server, verify UI)",
+            description: "Run shell command (list files, start PHP/Node server, verify app)",
             parameters: {
               type: "object",
               properties: { command: { type: "string" } },
@@ -301,35 +322,40 @@ export default {
         },
       ];
 
-      // 10. Smart Model Routing & Auto-Fallback
+      // 10. Smart Model Routing & Safe Fallback
       const isBackgroundModel = requestedModel.toLowerCase().includes("haiku");
       const mainModel = request.headers.get("X-Target-Model") || env.TARGET_MODEL || "llama-3.3-70b-versatile";
       const fastModel = "llama-3.1-8b-instant";
       const chosenModel = isBackgroundModel ? fastModel : mainModel;
 
-      let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools, forceToolChoice);
+      let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools, toolChoiceMode);
+
+      // Agar tool_choice: "required" par koi error aaye toh "auto" ke saath retry karein
+      if (!groqRes.ok && toolChoiceMode === "required") {
+        groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools, "auto");
+      }
 
       if (!groqRes.ok && chosenModel !== fastModel) {
-        groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools, forceToolChoice);
+        groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools, "auto");
       }
 
       if (!groqRes.ok) {
         const errText = await groqRes.text();
-        return anthropicError(`Groq (${groqRes.status}): ${errText.slice(0, 180)}`, 502);
+        return anthropicError(`Groq (${groqRes.status}): ${errText.slice(0, 200)}`, 502);
       }
 
       const groqData = await groqRes.json();
       const choice = groqData.choices?.[0]?.message || {};
       let toolCalls = choice.tool_calls || [];
 
-      // 11. Hard Duplicate Blocker
+      // 11. Duplicate Read & Duplicate Command Blocker
       toolCalls = toolCalls.filter((tc) => {
         if (tc.function?.name === "Read") {
           try {
             const args = JSON.parse(tc.function.arguments || "{}");
             const normFp = (args.file_path || "").replace(/\\/g, "/").toLowerCase();
             if (!normFp) return false;
-            if (normFp.endsWith("project_memory.md")) return !memoryReadEver;
+            if (normFp.endsWith("project_memory.md")) return !memoryChecked;
             if (readFiles.has(normFp)) return false;
           } catch {
             return false;
@@ -349,7 +375,7 @@ export default {
 
       const finalReplyText =
         choice.content ||
-        (toolCalls.length === 0 ? `Checked and executed task in [${activeProjectName}].` : "");
+        (toolCalls.length === 0 ? `Completed task in [${targetProjectName}].` : "");
 
       return buildAnthropicReply(
         {
@@ -368,7 +394,6 @@ export default {
 // --- Helpers ---
 
 function detectActiveProject(sysText, messages) {
-  // 1. Check recent tool paths first (e.g. AI-Shop-Platform/index.php)
   for (let i = messages.length - 1; i >= 0; i--) {
     const content = messages[i]?.content;
     if (Array.isArray(content)) {
@@ -384,7 +409,6 @@ function detectActiveProject(sysText, messages) {
     }
   }
 
-  // 2. System prompt working directory
   const cwdMatch = sysText.match(/working directory:\s*([^\r\n]+)/i);
   if (cwdMatch && cwdMatch[1]) {
     const cleanRoot = cwdMatch[1].trim().replace(/[\\/]+$/, "").replace(/\\/g, "/");
@@ -400,16 +424,15 @@ function detectActiveProject(sysText, messages) {
 function extractPureUserPrompt(content) {
   if (!content) return "";
   if (typeof content === "string") {
-    const cleaned = content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
-    return cleaned.slice(0, 200);
+    return content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim().slice(0, 220);
   }
   if (Array.isArray(content)) {
-    // Only extract actual user text blocks, ignore tool_result blocks completely
-    const textBlocks = content
+    return content
       .filter((c) => c.type === "text" && c.text)
       .map((c) => c.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim())
-      .filter(Boolean);
-    return textBlocks.join(" ").slice(0, 200);
+      .filter(Boolean)
+      .join(" ")
+      .slice(0, 220);
   }
   return "";
 }
@@ -442,51 +465,61 @@ function extractText(content) {
   return "";
 }
 
-function mapAnthropicToGroqMsg(msg) {
+// Properly maps ALL parallel tool_uses and tool_results (prevents 400 mismatch errors)
+function mapAnthropicToGroqMessages(msg) {
   const role = msg.role === "assistant" ? "assistant" : "user";
   const content = msg.content;
 
   if (typeof content === "string") {
-    return { role, content: content.slice(-1100) };
+    const clean = content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
+    return clean ? [{ role, content: clean.slice(-1100) }] : [];
   }
 
   if (Array.isArray(content)) {
-    const toolRes = content.find((c) => c.type === "tool_result");
-    if (toolRes) {
-      const out = typeof toolRes.content === "string" ? toolRes.content : JSON.stringify(toolRes.content);
-      return {
-        role: "tool",
-        tool_call_id: toolRes.tool_use_id || "call_1",
-        content: out.slice(0, 1200),
-      };
+    // 1. Handle multiple tool_result blocks from user message
+    const toolResults = content.filter((c) => c.type === "tool_result");
+    if (toolResults.length > 0) {
+      return toolResults.map((tr) => {
+        const out = typeof tr.content === "string" ? tr.content : JSON.stringify(tr.content);
+        return {
+          role: "tool",
+          tool_call_id: tr.tool_use_id || "call_1",
+          content: out.slice(0, 1200),
+        };
+      });
     }
 
-    const toolUse = content.find((c) => c.type === "tool_use");
-    if (toolUse && role === "assistant") {
-      return {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: toolUse.id,
+    // 2. Handle multiple parallel tool_use blocks from assistant message
+    const toolUses = content.filter((c) => c.type === "tool_use");
+    if (toolUses.length > 0 && role === "assistant") {
+      return [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: toolUses.map((tu) => ({
+            id: tu.id,
             type: "function",
             function: {
-              name: toolUse.name,
-              arguments: JSON.stringify(toolUse.input || {}),
+              name: tu.name,
+              arguments: JSON.stringify(tu.input || {}),
             },
-          },
-        ],
-      };
+          })),
+        },
+      ];
     }
 
+    // 3. Normal text blocks
     const text = content
       .filter((c) => c.type === "text" && c.text)
-      .map((c) => c.text)
+      .map((c) => c.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim())
+      .filter(Boolean)
       .join("\n")
       .slice(-1100);
-    if (text) return { role, content: text };
+
+    return text ? [{ role, content: text }] : [];
   }
-  return null;
+
+  return [];
 }
 
 function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
@@ -530,7 +563,7 @@ function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
         content: [],
         model,
         stop_reason: null,
-        usage: { input_tokens: 600, output_tokens: 1 },
+        usage: { input_tokens: 550, output_tokens: 1 },
       },
     })}\n\n`;
 
@@ -591,7 +624,7 @@ function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
     model,
     content: contentBlocks,
     stop_reason: stopReason,
-    usage: { input_tokens: 600, output_tokens: 200 },
+    usage: { input_tokens: 550, output_tokens: 200 },
   });
 }
 
