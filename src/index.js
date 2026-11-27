@@ -80,15 +80,17 @@ export default {
         return buildAnthropicReply({ text: "Coding Task" }, body.stream, requestedModel);
       }
 
-      // 5. ACTIVE PROJECT DETECTOR
+      // 5. ACTIVE PROJECT & WORKSPACE DETECTOR
       const projectInfo = detectActiveProject(rawSysText, allMsgs);
       const activeProjectName = projectInfo.name;
       const activeProjectRoot = projectInfo.root;
+      const isWorkspaceRoot = /^(project|projects|htdocs|www)$/i.test(activeProjectName);
+
       const memoryFilePath = activeProjectRoot
         ? `${activeProjectRoot.replace(/[\\/]+$/, "")}/PROJECT_MEMORY.md`
         : "PROJECT_MEMORY.md";
 
-      // 6. FULL-HISTORY STATE TRACKER (Kabhi reset nahi hoga)
+      // 6. CLEAN STATE TRACKER (Ignores <system-reminder> and tool_result noise)
       let startIdx = 0;
       if (activeProjectName !== "default") {
         for (let i = allMsgs.length - 1; i >= 0; i--) {
@@ -101,26 +103,24 @@ export default {
       }
 
       const activeMsgs = allMsgs.slice(startIdx);
-      const readFiles = new Set(); // Normalized lowercase paths
+      const readFiles = new Set();
       const modifiedFiles = new Set();
       const ranCommands = new Set();
-      const userTasks = [];
+      const cleanUserPrompts = [];
 
       let memoryReadEver = false;
       let memoryMissing = false;
-      let memoryUpdatedThisTurn = false;
-      let codeModifiedThisTurn = 0;
-      let bashRanThisTurn = 0;
-      let hasPromptTxt = false;
-      let promptTxtRead = false;
-
+      let memoryCreatedOrUpdatedThisTurn = false;
+      let realWorkDoneThisTurn = 0;
       let lastUserTurnIdx = 0;
-      for (let i = activeMsgs.length - 1; i >= 0; i--) {
-        if (activeMsgs[i].role === "user") {
-          const t = extractText(activeMsgs[i].content).trim();
-          if (t && !t.startsWith("<system-reminder>") && !t.startsWith("[")) {
+
+      for (let i = 0; i < activeMsgs.length; i++) {
+        const m = activeMsgs[i];
+        if (m.role === "user") {
+          const pureText = extractPureUserPrompt(m.content);
+          if (pureText) {
+            cleanUserPrompts.push(pureText);
             lastUserTurnIdx = i;
-            break;
           }
         }
       }
@@ -129,25 +129,16 @@ export default {
         const m = activeMsgs[i];
         const isCurrentTurn = i >= lastUserTurnIdx;
 
-        if (m.role === "user") {
-          const t = extractText(m.content).trim();
-          if (t && !t.startsWith("<system-reminder>") && !t.startsWith("[")) {
-            userTasks.push(t.replace(/\s+/g, " ").slice(0, 180));
-          }
-          if (Array.isArray(m.content)) {
-            for (const block of m.content) {
-              if (block.type === "tool_result") {
-                const resStr = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
-                const lowerRes = resStr.toLowerCase();
-                if (lowerRes.includes("prompt.txt")) {
-                  hasPromptTxt = true;
-                }
-                if (
-                  memoryReadEver &&
-                  (lowerRes.includes("does not exist") || lowerRes.includes("no such file") || lowerRes.includes("enoent"))
-                ) {
-                  memoryMissing = true;
-                }
+        if (m.role === "user" && Array.isArray(m.content)) {
+          for (const block of m.content) {
+            if (block.type === "tool_result") {
+              const resStr = (typeof block.content === "string" ? block.content : JSON.stringify(block.content)).toLowerCase();
+              if (
+                memoryReadEver &&
+                !memoryCreatedOrUpdatedThisTurn &&
+                (resStr.includes("does not exist") || resStr.includes("no such file") || resStr.includes("enoent"))
+              ) {
+                memoryMissing = true;
               }
             }
           }
@@ -165,99 +156,111 @@ export default {
                   memoryReadEver = true;
                 } else {
                   readFiles.add(normFp);
-                  if (normFp.endsWith("prompt.txt")) promptTxtRead = true;
+                  if (isCurrentTurn) realWorkDoneThisTurn++;
                 }
               } else if ((block.name === "Edit" || block.name === "Write") && normFp) {
                 if (isMemFile) {
                   memoryMissing = false;
-                  if (isCurrentTurn) memoryUpdatedThisTurn = true;
+                  memoryReadEver = true;
+                  if (isCurrentTurn) memoryCreatedOrUpdatedThisTurn = true;
                 } else {
                   modifiedFiles.add(`${block.name}:${rawFp}`);
                   if (isCurrentTurn) {
-                    codeModifiedThisTurn++;
-                    memoryUpdatedThisTurn = false;
+                    realWorkDoneThisTurn++;
+                    memoryCreatedOrUpdatedThisTurn = false;
                   }
                 }
               } else if (block.name === "Bash" && block.input?.command) {
                 ranCommands.add(block.input.command.trim());
-                if (isCurrentTurn) bashRanThisTurn++;
+                if (isCurrentTurn) realWorkDoneThisTurn++;
               }
             }
           }
         }
       }
 
-      const latestUserPrompt = userTasks[userTasks.length - 1] || "";
-      const promptFilePath = activeProjectRoot
-        ? `${activeProjectRoot.replace(/[\\/]+$/, "")}/prompt.txt`
-        : "prompt.txt";
+      const latestUserPrompt = cleanUserPrompts[cleanUserPrompts.length - 1] || "Check UI and run project";
 
-      // 7. STRICT NON-REPEATING PIPELINE
+      // 7. DIRECT EXECUTION PIPELINE
       let workflowInstruction = "";
       let forceToolChoice = "auto";
 
-      if (memoryMissing) {
+      if (isWorkspaceRoot && ranCommands.size === 0) {
+        // User d:\project mein hai -> Pehle subfolders detect karo
         workflowInstruction =
-          `"${memoryFilePath}" does NOT exist. Call Write NOW to create "${memoryFilePath}" with "# Project: ${activeProjectName}\n\n## Completed Tasks\n- Initialized\n\n## Pending Tasks\n- ${latestUserPrompt}\n\n## Recent Changes\n- Created memory file".`;
+          `Current directory is workspace root "${activeProjectRoot || "d:/project"}". ` +
+          `First call Bash with "ls -d */" to find the project folder (e.g. AI-Shop-Platform), then inspect and run it.`;
+        forceToolChoice = "required";
+      } else if (memoryMissing && !memoryCreatedOrUpdatedThisTurn) {
+        // PROJECT_MEMORY.md nahi mili -> Ek hi turn mein Write se memory banao + project check/run karo
+        workflowInstruction =
+          `"${memoryFilePath}" does not exist. Call Write ONCE to create "${memoryFilePath}" with clean markdown:\n` +
+          `# Project: ${activeProjectName}\n\n## Completed Tasks\n- Initialized memory\n\n## Pending Tasks\n- ${latestUserPrompt}\n\n## Recent Changes\n- Created PROJECT_MEMORY.md\n` +
+          `AND in the same turn, start executing the user's request ("${latestUserPrompt}") using Read or Bash.`;
         forceToolChoice = "required";
       } else if (!memoryReadEver) {
-        workflowInstruction = `Call Read ONCE on "${memoryFilePath}". NEVER read it again after this.`;
-        forceToolChoice = "required";
-      } else if (hasPromptTxt && !promptTxtRead) {
         workflowInstruction =
-          `PROJECT_MEMORY.md is already read. Folder has "prompt.txt". Call Read ONCE on "${promptFilePath}" to get project specs, then immediately build the files.`;
+          `Call Read ONCE on "${memoryFilePath}" AND also start checking/running the project for: "${latestUserPrompt}".`;
         forceToolChoice = "required";
-      } else if (codeModifiedThisTurn === 0) {
+      } else if (realWorkDoneThisTurn === 0) {
+        // Abhi tak koi asli kaam (UI check / file edit / server run) nahi hua -> Force execute!
         workflowInstruction =
-          `STOP running ls or reading PROJECT_MEMORY.md! Start building the project files NOW using Write or Edit in "${activeProjectName}". ` +
-          `Create multiple files in parallel if needed. Already read (DO NOT READ AGAIN): [${Array.from(readFiles).join(", ")}, project_memory.md].`;
+          `DO NOT stop or rewrite PROJECT_MEMORY.md yet! Execute the user's request ("${latestUserPrompt}") right now: ` +
+          `1) Check UI files (index.php/index.html/src) using Read (never re-read [${Array.from(readFiles).join(", ")}]). ` +
+          `2) Fix any UI issues if found, and run/verify the project using Bash (e.g., php -S localhost:8000 or npm run dev or checking XAMPP).`;
         forceToolChoice = "required";
-      } else if (codeModifiedThisTurn > 0 && !memoryUpdatedThisTurn) {
+      } else if (modifiedFiles.size > 0 && !memoryCreatedOrUpdatedThisTurn) {
         workflowInstruction =
-          `Files created/updated (${Array.from(modifiedFiles).slice(-4).join(", ")}). Now update "${memoryFilePath}" using Write or Edit with completed work and remaining tasks.`;
+          `Code updated (${Array.from(modifiedFiles).slice(-3).join(", ")}). Update "${memoryFilePath}" once with what was fixed/run, then give final summary.`;
         forceToolChoice = "required";
       } else {
         workflowInstruction =
-          `Work completed and PROJECT_MEMORY.md updated. Give a short 2-line summary of files created/updated in "${activeProjectName}".`;
+          `Task completed in "${activeProjectName}". Summarize what was checked, fixed, and how the project is running (including local URL/port if started).`;
         forceToolChoice = "auto";
       }
 
-      // 8. Build Compact Context (~600 tokens max)
+      // 8. Build Compact Context (~580 tokens max)
       const groqMessages = [
         {
           role: "system",
           content:
-            `You are Claude Code in project "${activeProjectName}". Execute multiple file creations/edits in parallel in one turn.\n` +
+            `You are Claude Code working in "${activeProjectName}" (Root: "${activeProjectRoot || "."}"). Never stop until the user's actual task is executed.\n` +
             workflowInstruction,
+        },
+        {
+          role: "user",
+          content: `USER REQUEST: ${latestUserPrompt}`,
         },
       ];
 
-      if (latestUserPrompt) {
-        groqMessages.push({
-          role: "user",
-          content: `TASK [${activeProjectName}]: ${latestUserPrompt}`,
-        });
-      }
-
-      // Aakhiri 2 messages add karein (tool_result ko 1200 chars tak rakhein taaki prompt.txt ke specs aa sakein)
+      // Aakhiri 2 messages add karein (tool calls & outputs)
       const recentMsgs = activeMsgs.slice(-2);
       for (const m of recentMsgs) {
         const mapped = mapAnthropicToGroqMsg(m);
-        if (mapped) {
-          if (mapped.role === "user" && latestUserPrompt && mapped.content.includes(latestUserPrompt.slice(0, 60))) {
-            continue;
-          }
+        if (mapped && mapped.role !== "user") {
           groqMessages.push(mapped);
         }
       }
 
-      // 9. Dynamic Tools (Read tool ko tab hata dein jab PROJECT_MEMORY.md aur prompt.txt dono read ho chuke hon)
+      // 9. Compact Tools
       const compactTools = [
         {
           type: "function",
           function: {
+            name: "Read",
+            description: "Read an unread file ONCE",
+            parameters: {
+              type: "object",
+              properties: { file_path: { type: "string" } },
+              required: ["file_path"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
             name: "Write",
-            description: "Create or overwrite a file with full code",
+            description: "Create or overwrite a file",
             parameters: {
               type: "object",
               properties: {
@@ -284,39 +287,19 @@ export default {
             },
           },
         },
-      ];
-
-      // Read sirf tab dein jab PROJECT_MEMORY.md ya koi unread file bachi ho
-      if (!memoryReadEver || (hasPromptTxt && !promptTxtRead) || readFiles.size < 2) {
-        compactTools.push({
-          type: "function",
-          function: {
-            name: "Read",
-            description: "Read an unread file ONCE",
-            parameters: {
-              type: "object",
-              properties: { file_path: { type: "string" } },
-              required: ["file_path"],
-            },
-          },
-        });
-      }
-
-      // Bash sirf tab dein jab pehle ls na chala ho
-      if (bashRanThisTurn === 0 && ranCommands.size < 2) {
-        compactTools.push({
+        {
           type: "function",
           function: {
             name: "Bash",
-            description: "Run shell command (never repeat ls)",
+            description: "Run shell command (check files, start PHP/Node server, verify UI)",
             parameters: {
               type: "object",
               properties: { command: { type: "string" } },
               required: ["command"],
             },
           },
-        });
-      }
+        },
+      ];
 
       // 10. Smart Model Routing & Auto-Fallback
       const isBackgroundModel = requestedModel.toLowerCase().includes("haiku");
@@ -339,7 +322,7 @@ export default {
       const choice = groqData.choices?.[0]?.message || {};
       let toolCalls = choice.tool_calls || [];
 
-      // 11. Hard Blocker: Duplicate Read & Duplicate ls Commands
+      // 11. Hard Duplicate Blocker
       toolCalls = toolCalls.filter((tc) => {
         if (tc.function?.name === "Read") {
           try {
@@ -356,7 +339,7 @@ export default {
           try {
             const args = JSON.parse(tc.function.arguments || "{}");
             const cmd = (args.command || "").trim();
-            if (ranCommands.has(cmd) || cmd.startsWith("ls ")) return false;
+            if (ranCommands.has(cmd)) return false;
           } catch {
             return false;
           }
@@ -366,7 +349,7 @@ export default {
 
       const finalReplyText =
         choice.content ||
-        (toolCalls.length === 0 ? `Completed updates in [${activeProjectName}].` : "");
+        (toolCalls.length === 0 ? `Checked and executed task in [${activeProjectName}].` : "");
 
       return buildAnthropicReply(
         {
@@ -385,21 +368,13 @@ export default {
 // --- Helpers ---
 
 function detectActiveProject(sysText, messages) {
-  const cwdMatch = sysText.match(/working directory:\s*([^\r\n]+)/i);
-  if (cwdMatch && cwdMatch[1]) {
-    const cleanRoot = cwdMatch[1].trim().replace(/[\\/]+$/, "").replace(/\\/g, "/");
-    const folderName = cleanRoot.split("/").pop();
-    if (folderName) {
-      return { name: folderName, root: cleanRoot };
-    }
-  }
-
+  // 1. Check recent tool paths first (e.g. AI-Shop-Platform/index.php)
   for (let i = messages.length - 1; i >= 0; i--) {
     const content = messages[i]?.content;
     if (Array.isArray(content)) {
       for (const block of content) {
         const fp = (block.input?.file_path || "").replace(/\\/g, "/");
-        if (fp && fp.includes("/")) {
+        if (fp && fp.includes("/") && !fp.toLowerCase().endsWith("project_memory.md")) {
           const parts = fp.split("/").filter(Boolean);
           if (parts.length >= 2) {
             return { name: parts[parts.length - 2], root: parts.slice(0, -1).join("/") };
@@ -409,7 +384,34 @@ function detectActiveProject(sysText, messages) {
     }
   }
 
+  // 2. System prompt working directory
+  const cwdMatch = sysText.match(/working directory:\s*([^\r\n]+)/i);
+  if (cwdMatch && cwdMatch[1]) {
+    const cleanRoot = cwdMatch[1].trim().replace(/[\\/]+$/, "").replace(/\\/g, "/");
+    const folderName = cleanRoot.split("/").pop();
+    if (folderName) {
+      return { name: folderName, root: cleanRoot };
+    }
+  }
+
   return { name: "default", root: "" };
+}
+
+function extractPureUserPrompt(content) {
+  if (!content) return "";
+  if (typeof content === "string") {
+    const cleaned = content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
+    return cleaned.slice(0, 200);
+  }
+  if (Array.isArray(content)) {
+    // Only extract actual user text blocks, ignore tool_result blocks completely
+    const textBlocks = content
+      .filter((c) => c.type === "text" && c.text)
+      .map((c) => c.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim())
+      .filter(Boolean);
+    return textBlocks.join(" ").slice(0, 200);
+  }
+  return "";
 }
 
 async function callGroq(apiKey, model, messages, tools, toolChoice = "auto") {
