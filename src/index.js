@@ -80,7 +80,7 @@ export default {
         return buildAnthropicReply({ text: "Coding Task" }, body.stream, requestedModel);
       }
 
-      // 5. ACTIVE PROJECT DETECTOR (Har project ke root mein apni PROJECT_MEMORY.md banegi)
+      // 5. ACTIVE PROJECT DETECTOR
       const projectInfo = detectActiveProject(rawSysText, allMsgs);
       const activeProjectName = projectInfo.name;
       const activeProjectRoot = projectInfo.root;
@@ -88,7 +88,7 @@ export default {
         ? `${activeProjectRoot.replace(/[\\/]+$/, "")}/PROJECT_MEMORY.md`
         : "PROJECT_MEMORY.md";
 
-      // 6. SESSION STATE TRACKER (Check karein ki is turn mein PROJECT_MEMORY.md padhi/update hui ya nahi)
+      // 6. SESSION STATE TRACKER
       let startIdx = 0;
       if (activeProjectName !== "default") {
         for (let i = allMsgs.length - 1; i >= 0; i--) {
@@ -104,15 +104,30 @@ export default {
       const readFiles = new Set();
       const modifiedFiles = new Set();
       const userTasks = [];
-      let memoryReadInSession = false;
-      let memoryUpdatedAfterWork = false;
+      let memoryChecked = false;
+      let memoryMissing = false;
+      let memoryCreatedOrUpdated = false;
       let codeModifiedCount = 0;
 
       for (const m of activeMsgs) {
         if (m.role === "user") {
           const t = extractText(m.content).trim();
           if (t && !t.startsWith("<system-reminder>") && !t.startsWith("[")) {
-            userTasks.push(t.replace(/\s+/g, " ").slice(0, 140));
+            userTasks.push(t.replace(/\s+/g, " ").slice(0, 160));
+          }
+          // Check agar Read tool ne bataya ki PROJECT_MEMORY.md exist nahi karti
+          if (Array.isArray(m.content)) {
+            for (const block of m.content) {
+              if (block.type === "tool_result") {
+                const resStr = (typeof block.content === "string" ? block.content : JSON.stringify(block.content)).toLowerCase();
+                if (
+                  memoryChecked &&
+                  (resStr.includes("does not exist") || resStr.includes("no such file") || resStr.includes("enoent") || resStr.includes("not found"))
+                ) {
+                  memoryMissing = true;
+                }
+              }
+            }
           }
         }
         if (m.role === "assistant" && Array.isArray(m.content)) {
@@ -123,17 +138,18 @@ export default {
 
               if (block.name === "Read" && fp) {
                 if (isMemFile) {
-                  memoryReadInSession = true;
+                  memoryChecked = true;
                 } else {
                   readFiles.add(fp);
                 }
               } else if ((block.name === "Edit" || block.name === "Write") && fp) {
                 if (isMemFile) {
-                  memoryUpdatedAfterWork = true;
+                  memoryCreatedOrUpdated = true;
+                  memoryMissing = false;
                 } else {
                   modifiedFiles.add(`${block.name}:${fp}`);
                   codeModifiedCount++;
-                  memoryUpdatedAfterWork = false; // Har naye code change ke baad memory update zaroori hai
+                  memoryCreatedOrUpdated = false;
                 }
               }
             }
@@ -143,22 +159,32 @@ export default {
 
       const latestUserPrompt = userTasks[userTasks.length - 1] || "";
 
-      // 7. STRICT WORKFLOW ENFORCEMENT (Read PROJECT_MEMORY.md First -> Do Task -> Update PROJECT_MEMORY.md)
+      // 7. DIRECT ACTION INSTRUCTIONS (No unnecessary text messages)
       let workflowInstruction = "";
+      let forceToolChoice = "auto";
 
-      if (!memoryReadInSession) {
+      if (memoryMissing && !memoryCreatedOrUpdated) {
+        // File nahi mili -> Seedha Write tool se create karwao
         workflowInstruction =
-          `MANDATORY STEP 1: Before doing anything else, call Read on "${memoryFilePath}" to check project history, completed tasks, and pending tasks. ` +
-          `If Read fails because the file does not exist yet, create "${memoryFilePath}" using Write with sections: "# Project: ${activeProjectName}", "## Completed Tasks", "## Pending Tasks", "## Recent Changes".`;
-      } else if (codeModifiedCount > 0 && !memoryUpdatedAfterWork) {
+          `"${memoryFilePath}" does NOT exist yet. Immediately call the Write tool to create "${memoryFilePath}" with:\n` +
+          `# Project: ${activeProjectName}\n\n## Completed Tasks\n- Initialized project memory\n\n## Pending Tasks\n- ${latestUserPrompt || "Setup project"}\n\n## Recent Changes\n- Created PROJECT_MEMORY.md\n` +
+          `Do NOT reply with text—call Write now.`;
+        forceToolChoice = "required";
+      } else if (!memoryChecked && !memoryCreatedOrUpdated) {
+        // Pehli baar Read tool se check karwao
         workflowInstruction =
-          `MANDATORY FINAL STEP: You just modified code (${Array.from(modifiedFiles).slice(-3).join(", ")}). ` +
-          `Now immediately update "${memoryFilePath}" using Edit or Write to move finished items to "## Completed Tasks", update "## Pending Tasks", and log what changed under "## Recent Changes". Then finish.`;
+          `First call Read on "${memoryFilePath}". Do NOT reply with text yet—call Read now.`;
+        forceToolChoice = "required";
+      } else if (codeModifiedCount > 0 && !memoryCreatedOrUpdated) {
+        // Code edit hone ke baad memory update karwao
+        workflowInstruction =
+          `Code modified (${Array.from(modifiedFiles).slice(-3).join(", ")}). Immediately call Edit or Write on "${memoryFilePath}" to log completed work and update pending tasks.`;
+        forceToolChoice = "required";
       } else {
+        // Main task execution
         workflowInstruction =
-          `STEP 2 (EXECUTION): Execute the user's current/pending task in "${activeProjectName}". ` +
-          `Do NOT re-read already read files: [${Array.from(readFiles).join(", ")}]. ` +
-          `After modifying any code file, you MUST update "${memoryFilePath}" with the new progress.`;
+          `PROJECT_MEMORY.md is ready. Now execute the user's task in "${activeProjectName}" using Edit, Write, Read (only unread files), or Bash. ` +
+          `Already read files (DO NOT re-read): [${Array.from(readFiles).join(", ")}].`;
       }
 
       // 8. Build Compact Context (~550 tokens max)
@@ -166,8 +192,7 @@ export default {
         {
           role: "system",
           content:
-            `You are Claude Code in project "${activeProjectName}" (Memory File: "${memoryFilePath}"). ` +
-            `STRICT WORKFLOW: 1) Always read "${memoryFilePath}" first before starting work. 2) Execute next/pending task without unnecessary file reads. 3) Always update "${memoryFilePath}" with newly completed work and remaining pending tasks before finishing.\n` +
+            `You are Claude Code in project "${activeProjectName}". Always use tools directly instead of explaining.\n` +
             workflowInstruction,
         },
       ];
@@ -175,11 +200,10 @@ export default {
       if (latestUserPrompt) {
         groqMessages.push({
           role: "user",
-          content: `CURRENT USER REQUEST [${activeProjectName}]: ${latestUserPrompt}`,
+          content: `TASK [${activeProjectName}]: ${latestUserPrompt}`,
         });
       }
 
-      // Sirf aakhiri 2 messages (latest tool call + tool result) rakhein
       const recentMsgs = activeMsgs.slice(-2);
       for (const m of recentMsgs) {
         const mapped = mapAnthropicToGroqMsg(m);
@@ -191,17 +215,20 @@ export default {
         }
       }
 
-      // 9. Compact Tools (Read hamesha available rahega PROJECT_MEMORY.md ke liye, baaki files max 3)
+      // 9. Compact Tools
       const compactTools = [
         {
           type: "function",
           function: {
-            name: "Read",
-            description: `Read "${memoryFilePath}" first, or read an unread project file ONLY when needed`,
+            name: "Write",
+            description: "Create or overwrite a file",
             parameters: {
               type: "object",
-              properties: { file_path: { type: "string" } },
-              required: ["file_path"],
+              properties: {
+                file_path: { type: "string" },
+                content: { type: "string" },
+              },
+              required: ["file_path", "content"],
             },
           },
         },
@@ -209,7 +236,7 @@ export default {
           type: "function",
           function: {
             name: "Edit",
-            description: "Replace exact text in a file or update PROJECT_MEMORY.md",
+            description: "Replace exact text in a file",
             parameters: {
               type: "object",
               properties: {
@@ -224,15 +251,12 @@ export default {
         {
           type: "function",
           function: {
-            name: "Write",
-            description: "Create or overwrite a file (including PROJECT_MEMORY.md)",
+            name: "Read",
+            description: "Read a file",
             parameters: {
               type: "object",
-              properties: {
-                file_path: { type: "string" },
-                content: { type: "string" },
-              },
-              required: ["file_path", "content"],
+              properties: { file_path: { type: "string" } },
+              required: ["file_path"],
             },
           },
         },
@@ -240,7 +264,7 @@ export default {
           type: "function",
           function: {
             name: "Bash",
-            description: "Run shell command in active project",
+            description: "Run shell command",
             parameters: {
               type: "object",
               properties: { command: { type: "string" } },
@@ -256,10 +280,10 @@ export default {
       const fastModel = "llama-3.1-8b-instant";
       const chosenModel = isBackgroundModel ? fastModel : mainModel;
 
-      let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools);
+      let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools, forceToolChoice);
 
       if (!groqRes.ok && chosenModel !== fastModel) {
-        groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools);
+        groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools, forceToolChoice);
       }
 
       if (!groqRes.ok) {
@@ -271,14 +295,14 @@ export default {
       const choice = groqData.choices?.[0]?.message || {};
       let toolCalls = choice.tool_calls || [];
 
-      // 11. Hard Duplicate-Read Blocker (PROJECT_MEMORY.md ke ilawa kisi bhi file ko dubara read nahi karne dega)
+      // 11. Hard Duplicate-Read Blocker
       toolCalls = toolCalls.filter((tc) => {
         if (tc.function?.name === "Read") {
           try {
             const args = JSON.parse(tc.function.arguments || "{}");
             const fp = (args.file_path || "").replace(/\\/g, "/");
             if (!fp) return false;
-            if (fp.toLowerCase().endsWith("project_memory.md")) return true;
+            if (fp.toLowerCase().endsWith("project_memory.md")) return !memoryChecked;
             if (readFiles.has(fp) || readFiles.size >= 3) return false;
           } catch {
             return false;
@@ -287,10 +311,7 @@ export default {
         return true;
       });
 
-      const finalReplyText =
-        !choice.content && toolCalls.length === 0
-          ? `Updated [${activeProjectName}] and synced PROJECT_MEMORY.md. Ready for the next task.`
-          : choice.content || "";
+      const finalReplyText = choice.content || (toolCalls.length === 0 ? "Ready." : "");
 
       return buildAnthropicReply(
         {
@@ -336,7 +357,7 @@ function detectActiveProject(sysText, messages) {
   return { name: "default", root: "" };
 }
 
-async function callGroq(apiKey, model, messages, tools) {
+async function callGroq(apiKey, model, messages, tools, toolChoice = "auto") {
   return fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -347,7 +368,7 @@ async function callGroq(apiKey, model, messages, tools) {
       model,
       messages,
       tools,
-      tool_choice: "auto",
+      tool_choice: toolChoice,
       max_tokens: 1024,
       temperature: 0.1,
     }),
