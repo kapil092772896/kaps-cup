@@ -137,4 +137,440 @@ export default {
                 const resStr = (typeof block.content === "string" ? block.content : JSON.stringify(block.content)).toLowerCase();
                 if (
                   memoryChecked &&
-                  (
+                  (resStr.includes("does not exist") || resStr.includes("no such file") || resStr.includes("enoent") || resStr.includes("not found"))
+                ) {
+                  memoryMissing = true;
+                }
+              }
+            }
+          }
+        }
+        if (m.role === "assistant" && Array.isArray(m.content)) {
+          for (const block of m.content) {
+            if (block.type === "tool_use") {
+              const fp = (block.input?.file_path || "").replace(/\\/g, "/");
+              const isMemFile = fp.toLowerCase().endsWith("project_memory.md");
+
+              if (block.name === "Read" && fp) {
+                if (isMemFile) {
+                  if (isCurrentTurn) memoryChecked = true;
+                } else {
+                  readFiles.add(fp);
+                }
+              } else if ((block.name === "Edit" || block.name === "Write") && fp) {
+                if (isMemFile) {
+                  if (isCurrentTurn) memoryCreatedOrUpdated = true;
+                  memoryMissing = false;
+                } else {
+                  modifiedFiles.add(`${block.name}:${fp}`);
+                  if (isCurrentTurn) {
+                    codeModifiedCount++;
+                    memoryCreatedOrUpdated = false;
+                  }
+                }
+              } else if (block.name === "Bash" && isCurrentTurn) {
+                bashRanCount++;
+              }
+            }
+          }
+        }
+      }
+
+      const latestUserPrompt = userTasks[userTasks.length - 1] || "";
+      const isActionTask = !/^(hi|hello|hey|thanks|ok|status|kya hua)\b/i.test(latestUserPrompt);
+
+      // 7. STRICT CONTINUOUS PIPELINE (Read/Create Memory -> Execute Task -> Update Memory -> Finish)
+      let workflowInstruction = "";
+      let forceToolChoice = "auto";
+
+      if (memoryMissing && !memoryCreatedOrUpdated) {
+        // Step 1A: File nahi mili -> Seedha Write se banao
+        workflowInstruction =
+          `"${memoryFilePath}" does NOT exist. Immediately call Write to create "${memoryFilePath}" with:\n` +
+          `# Project: ${activeProjectName}\n\n## Completed Tasks\n- Initialized project memory\n\n## Pending Tasks\n- ${latestUserPrompt || "Setup project"}\n\n## Recent Changes\n- Created PROJECT_MEMORY.md`;
+        forceToolChoice = "required";
+      } else if (!memoryChecked && !memoryCreatedOrUpdated) {
+        // Step 1B: Pehle PROJECT_MEMORY.md padho
+        workflowInstruction =
+          `First call Read on "${memoryFilePath}" to check project status and pending tasks.`;
+        forceToolChoice = "required";
+      } else if (isActionTask && codeModifiedCount === 0 && bashRanCount === 0) {
+        // Step 2: Memory ready hai, ab RUKNA NAHI HAI—seedha user ka task execute karo!
+        workflowInstruction =
+          `PROJECT_MEMORY.md is ready. DO NOT stop or reply with text yet! Immediately execute the user's task ("${latestUserPrompt}") using Read (only unread files), Write, Edit, or Bash. ` +
+          `Already read files (DO NOT re-read): [${Array.from(readFiles).join(", ")}].`;
+        forceToolChoice = "required";
+      } else if (codeModifiedCount > 0 && !memoryCreatedOrUpdated) {
+        // Step 3: Code change ho gaya -> Ab PROJECT_MEMORY.md update karo
+        workflowInstruction =
+          `Task executed (${Array.from(modifiedFiles).slice(-3).join(", ")}). Immediately call Edit or Write on "${memoryFilePath}" to mark this task completed and update pending tasks.`;
+        forceToolChoice = "required";
+      } else {
+        // Step 4: Sab ho gaya -> Ab user ko short summary do
+        workflowInstruction =
+          `All steps complete and PROJECT_MEMORY.md is updated. Give a 1-2 line final summary of what was done in "${activeProjectName}".`;
+        forceToolChoice = "auto";
+      }
+
+      // 8. Build Compact Context (~550 tokens max)
+      const groqMessages = [
+        {
+          role: "system",
+          content:
+            `You are Claude Code in project "${activeProjectName}".\n` +
+            workflowInstruction,
+        },
+      ];
+
+      if (latestUserPrompt) {
+        groqMessages.push({
+          role: "user",
+          content: `TASK [${activeProjectName}]: ${latestUserPrompt}`,
+        });
+      }
+
+      const recentMsgs = activeMsgs.slice(-2);
+      for (const m of recentMsgs) {
+        const mapped = mapAnthropicToGroqMsg(m);
+        if (mapped) {
+          if (mapped.role === "user" && latestUserPrompt && mapped.content.includes(latestUserPrompt.slice(0, 60))) {
+            continue;
+          }
+          groqMessages.push(mapped);
+        }
+      }
+
+      // 9. Compact Tools
+      const compactTools = [
+        {
+          type: "function",
+          function: {
+            name: "Write",
+            description: "Create or overwrite a file",
+            parameters: {
+              type: "object",
+              properties: {
+                file_path: { type: "string" },
+                content: { type: "string" },
+              },
+              required: ["file_path", "content"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "Edit",
+            description: "Replace exact text in a file",
+            parameters: {
+              type: "object",
+              properties: {
+                file_path: { type: "string" },
+                old_string: { type: "string" },
+                new_string: { type: "string" },
+              },
+              required: ["file_path", "old_string", "new_string"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "Read",
+            description: "Read a file",
+            parameters: {
+              type: "object",
+              properties: { file_path: { type: "string" } },
+              required: ["file_path"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "Bash",
+            description: "Run shell command",
+            parameters: {
+              type: "object",
+              properties: { command: { type: "string" } },
+              required: ["command"],
+            },
+          },
+        },
+      ];
+
+      // 10. Smart Model Routing & Auto-Fallback
+      const isBackgroundModel = requestedModel.toLowerCase().includes("haiku");
+      const mainModel = request.headers.get("X-Target-Model") || env.TARGET_MODEL || "llama-3.3-70b-versatile";
+      const fastModel = "llama-3.1-8b-instant";
+      const chosenModel = isBackgroundModel ? fastModel : mainModel;
+
+      let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools, forceToolChoice);
+
+      if (!groqRes.ok && chosenModel !== fastModel) {
+        groqRes = await callGroq(apiKey, fastModel, groqMessages, compactTools, forceToolChoice);
+      }
+
+      if (!groqRes.ok) {
+        const errText = await groqRes.text();
+        return anthropicError(`Groq (${groqRes.status}): ${errText.slice(0, 180)}`, 502);
+      }
+
+      const groqData = await groqRes.json();
+      const choice = groqData.choices?.[0]?.message || {};
+      let toolCalls = choice.tool_calls || [];
+
+      // 11. Hard Duplicate-Read Blocker
+      toolCalls = toolCalls.filter((tc) => {
+        if (tc.function?.name === "Read") {
+          try {
+            const args = JSON.parse(tc.function.arguments || "{}");
+            const fp = (args.file_path || "").replace(/\\/g, "/");
+            if (!fp) return false;
+            if (fp.toLowerCase().endsWith("project_memory.md")) return !memoryChecked;
+            if (readFiles.has(fp) || readFiles.size >= 3) return false;
+          } catch {
+            return false;
+          }
+        }
+        return true;
+      });
+
+      const finalReplyText =
+        choice.content ||
+        (toolCalls.length === 0 ? `Completed task in [${activeProjectName}] and updated PROJECT_MEMORY.md.` : "");
+
+      return buildAnthropicReply(
+        {
+          text: finalReplyText,
+          toolCalls,
+        },
+        body.stream,
+        requestedModel
+      );
+    } catch (err) {
+      return anthropicError(`Proxy Error: ${err.message}`, 500);
+    }
+  },
+};
+
+// --- Helpers ---
+
+function detectActiveProject(sysText, messages) {
+  const cwdMatch = sysText.match(/working directory:\s*([^\r\n]+)/i);
+  if (cwdMatch && cwdMatch[1]) {
+    const cleanRoot = cwdMatch[1].trim().replace(/[\\/]+$/, "").replace(/\\/g, "/");
+    const folderName = cleanRoot.split("/").pop();
+    if (folderName) {
+      return { name: folderName, root: cleanRoot };
+    }
+  }
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const content = messages[i]?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        const fp = (block.input?.file_path || "").replace(/\\/g, "/");
+        if (fp && fp.includes("/")) {
+          const parts = fp.split("/").filter(Boolean);
+          if (parts.length >= 2) {
+            return { name: parts[parts.length - 2], root: parts.slice(0, -1).join("/") };
+          }
+        }
+      }
+    }
+  }
+
+  return { name: "default", root: "" };
+}
+
+async function callGroq(apiKey, model, messages, tools, toolChoice = "auto") {
+  return fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      tools,
+      tool_choice: toolChoice,
+      max_tokens: 1024,
+      temperature: 0.1,
+    }),
+  });
+}
+
+function extractText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((c) => c.text || c.content || "").join("\n");
+  }
+  return "";
+}
+
+function mapAnthropicToGroqMsg(msg) {
+  const role = msg.role === "assistant" ? "assistant" : "user";
+  const content = msg.content;
+
+  if (typeof content === "string") {
+    return { role, content: content.slice(-900) };
+  }
+
+  if (Array.isArray(content)) {
+    const toolRes = content.find((c) => c.type === "tool_result");
+    if (toolRes) {
+      const out = typeof toolRes.content === "string" ? toolRes.content : JSON.stringify(toolRes.content);
+      return {
+        role: "tool",
+        tool_call_id: toolRes.tool_use_id || "call_1",
+        content: out.slice(0, 900),
+      };
+    }
+
+    const toolUse = content.find((c) => c.type === "tool_use");
+    if (toolUse && role === "assistant") {
+      return {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: toolUse.id,
+            type: "function",
+            function: {
+              name: toolUse.name,
+              arguments: JSON.stringify(toolUse.input || {}),
+            },
+          },
+        ],
+      };
+    }
+
+    const text = content
+      .filter((c) => c.type === "text" && c.text)
+      .map((c) => c.text)
+      .join("\n")
+      .slice(-900);
+    if (text) return { role, content: text };
+  }
+  return null;
+}
+
+function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
+  const id = "msg_" + Date.now();
+  const model = modelName || "claude-3-5-sonnet-20241022";
+  const contentBlocks = [];
+
+  if (text) {
+    contentBlocks.push({ type: "text", text });
+  }
+
+  for (const tc of toolCalls) {
+    let parsedArgs = {};
+    try {
+      parsedArgs = JSON.parse(tc.function.arguments || "{}");
+    } catch {
+      parsedArgs = {};
+    }
+    contentBlocks.push({
+      type: "tool_use",
+      id: tc.id || "toolu_" + Date.now(),
+      name: tc.function.name,
+      input: parsedArgs,
+    });
+  }
+
+  if (contentBlocks.length === 0) {
+    contentBlocks.push({ type: "text", text: "Done." });
+  }
+
+  const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn";
+
+  if (isStream) {
+    const encoder = new TextEncoder();
+    let sse = `event: message_start\ndata: ${JSON.stringify({
+      type: "message_start",
+      message: {
+        id,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model,
+        stop_reason: null,
+        usage: { input_tokens: 550, output_tokens: 1 },
+      },
+    })}\n\n`;
+
+    contentBlocks.forEach((block, idx) => {
+      if (block.type === "text") {
+        sse += `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: idx,
+          content_block: { type: "text", text: "" },
+        })}\n\n`;
+        sse += `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "text_delta", text: block.text },
+        })}\n\n`;
+        sse += `event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop",
+          index: idx,
+        })}\n\n`;
+      } else if (block.type === "tool_use") {
+        sse += `event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: idx,
+          content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+        })}\n\n`;
+        sse += `event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
+        })}\n\n`;
+        sse += `event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop",
+          index: idx,
+        })}\n\n`;
+      }
+    });
+
+    sse += `event: message_delta\ndata: ${JSON.stringify({
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: 150 },
+    })}\n\n`;
+    sse += `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
+
+    return new Response(encoder.encode(sse), {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+
+  return jsonResponse({
+    id,
+    type: "message",
+    role: "assistant",
+    model,
+    content: contentBlocks,
+    stop_reason: stopReason,
+    usage: { input_tokens: 550, output_tokens: 150 },
+  });
+}
+
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+function anthropicError(message, status = 400) {
+  return jsonResponse({ type: "error", error: { type: "api_error", message } }, status);
+}
