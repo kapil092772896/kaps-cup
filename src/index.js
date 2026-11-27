@@ -40,7 +40,7 @@ export default {
 
     // 3. Token Counter Bypass
     if (url.pathname.includes("/count_tokens")) {
-      return jsonResponse({ input_tokens: 550 });
+      return jsonResponse({ input_tokens: 650 });
     }
 
     if (request.method !== "POST") {
@@ -86,7 +86,7 @@ export default {
       const activeProjectRoot = projectInfo.root;
       const isWorkspaceParent = /^(project|projects|htdocs|www)$/i.test(activeProjectName);
 
-      // 6. Full Session State Analysis (Clean, Ignores <system-reminder>)
+      // 6. Full Session State Analysis
       const readFiles = new Set();
       const modifiedFiles = new Set();
       const ranCommands = new Set();
@@ -106,17 +106,20 @@ export default {
       let detectedSubProject = "";
       let hasPromptTxt = false;
       let promptTxtRead = false;
+      let promptSummarySnippet = "";
       let memoryChecked = false;
       let memoryMissing = false;
       let memoryUpdatedThisTurn = false;
-      let codeWorkThisTurn = 0;
-      let bashWorkThisTurn = 0;
+      let filesCreatedOrEditedThisTurn = 0; // Sirf Write/Edit count hoga, Read nahi!
+      let realServerRunThisTurn = 0; // Sirf actual run/test commands, ls/wc nahi!
+
+      // Check user prompt for specific folder hint (e.g. "ai" -> AI-Shop-Platform)
+      const latestPromptLower = (cleanUserPrompts[cleanUserPrompts.length - 1] || "").toLowerCase();
 
       for (let i = 0; i < allMsgs.length; i++) {
         const m = allMsgs[i];
         const isCurrentTurn = i >= lastUserIdx;
 
-        // Inspect tool_results for directory listings, prompt.txt, or missing PROJECT_MEMORY.md
         if (m.role === "user" && Array.isArray(m.content)) {
           for (const block of m.content) {
             if (block.type === "tool_result") {
@@ -133,18 +136,25 @@ export default {
               ) {
                 memoryMissing = true;
               }
-              // Agar workspace parent mein ls chala toh subfolder name pakdein (e.g., AI-Shop-Platform/)
+              // Capture prompt.txt content if it was just read
+              if (promptTxtRead && !promptSummarySnippet && resStr.length > 150 && !resStr.includes("drwx")) {
+                promptSummarySnippet = resStr.replace(/\s+/g, " ").slice(0, 1400);
+              }
+              // Match subfolder from ls output
               if (isWorkspaceParent && !detectedSubProject) {
-                const dirMatch = resStr.match(/([A-Za-z0-9._-]+)\//);
-                if (dirMatch && !/^(node_modules|\.git|\.claude)$/i.test(dirMatch[1])) {
-                  detectedSubProject = dirMatch[1];
+                const folders = [...resStr.matchAll(/([A-Za-z0-9._-]+)\/?\s*$/gm)].map((x) => x[1]);
+                const validFolders = folders.filter((f) => !/^(node_modules|\.git|\.claude|\.+)$/i.test(f));
+                if (validFolders.length > 0) {
+                  const matched = validFolders.find((f) =>
+                    latestPromptLower.split(/\s+/).some((w) => w.length >= 2 && f.toLowerCase().includes(w))
+                  );
+                  detectedSubProject = matched || validFolders[0];
                 }
               }
             }
           }
         }
 
-        // Inspect assistant tool_use history
         if (m.role === "assistant" && Array.isArray(m.content)) {
           for (const block of m.content) {
             if (block.type === "tool_use") {
@@ -158,7 +168,6 @@ export default {
                 } else {
                   readFiles.add(normFp);
                   if (normFp.endsWith("prompt.txt")) promptTxtRead = true;
-                  if (isCurrentTurn) codeWorkThisTurn++;
                 }
               } else if ((block.name === "Edit" || block.name === "Write") && normFp) {
                 if (isMem) {
@@ -168,20 +177,23 @@ export default {
                 } else {
                   modifiedFiles.add(`${block.name}:${rawFp}`);
                   if (isCurrentTurn) {
-                    codeWorkThisTurn++;
+                    filesCreatedOrEditedThisTurn++;
                     memoryUpdatedThisTurn = false;
                   }
                 }
               } else if (block.name === "Bash" && block.input?.command) {
-                ranCommands.add(block.input.command.trim());
-                if (isCurrentTurn) bashWorkThisTurn++;
+                const cmd = block.input.command.trim();
+                ranCommands.add(cmd);
+                const isJustListing = /^(cd\s+[^&]+&&\s*)?(ls|dir|wc|pwd)\b/i.test(cmd);
+                if (isCurrentTurn && !isJustListing) {
+                  realServerRunThisTurn++;
+                }
               }
             }
           }
         }
       }
 
-      // Resolve final target folder & memory path
       const targetProjectName = detectedSubProject || activeProjectName;
       const targetRoot =
         detectedSubProject && activeProjectRoot
@@ -198,60 +210,62 @@ export default {
 
       const latestUserPrompt = cleanUserPrompts[cleanUserPrompts.length - 1] || "Build and run the project";
 
-      // 7. Step-by-Step Non-Stopping Execution Plan
+      // 7. Strict Non-Stopping Execution Plan (Read does NOT stop the loop)
       let stepInstruction = "";
       let toolChoiceMode = "auto";
 
       if (isWorkspaceParent && !detectedSubProject && ranCommands.size === 0) {
         stepInstruction =
-          `You are in parent folder "${activeProjectRoot || "d:/project"}". Run Bash with "ls -d */" to locate the active project folder.`;
+          `You are in parent folder "${activeProjectRoot || "."}". Run Bash with "ls -1" to find the matching project folder.`;
         toolChoiceMode = "required";
       } else if (memoryMissing && !memoryUpdatedThisTurn) {
         stepInstruction =
           `Create "${memoryFilePath}" using Write with:\n` +
           `# Project: ${targetProjectName}\n\n## Completed Tasks\n- Initialized project memory\n\n## Pending Tasks\n- ${latestUserPrompt}\n\n## Recent Changes\n- Created PROJECT_MEMORY.md\n` +
-          `Also check "${targetRoot || "."}" files using Bash ("ls -la ${targetRoot || "."}") in the same turn.`;
+          `And in the same turn, list "${targetRoot || "."}" files using Bash ("ls -1 ${targetRoot || "."}").`;
         toolChoiceMode = "required";
       } else if (!memoryChecked) {
         stepInstruction =
-          `Read "${memoryFilePath}" using Read (only once) and list files in "${targetRoot || "."}" using Bash ("ls -la ${targetRoot || "."}").`;
+          `Read "${memoryFilePath}" ONCE using Read and list files in "${targetRoot || "."}" using Bash ("ls -1 ${targetRoot || "."}").`;
         toolChoiceMode = "required";
       } else if (hasPromptTxt && !promptTxtRead) {
         stepInstruction =
-          `Read "${promptTxtPath}" ONCE using Read to understand full project specifications, then start building/updating the project.`;
+          `Read "${promptTxtPath}" ONCE using Read to get the project blueprint. Do NOT run ls/wc.`;
         toolChoiceMode = "required";
-      } else if (codeWorkThisTurn === 0 && bashWorkThisTurn === 0) {
+      } else if (filesCreatedOrEditedThisTurn === 0 && realServerRunThisTurn === 0) {
+        // prompt.txt read ho chuki hai, ab ASLI CODE LIKHNA YA RUN KARNA ZAROORI HAI!
+        const specHint = promptSummarySnippet ? `\nPROJECT SPECS FROM prompt.txt: ${promptSummarySnippet}\n` : "";
         stepInstruction =
-          `Execute the user's request ("${latestUserPrompt}") inside "${targetRoot || targetProjectName}" right now! ` +
-          `Use Write/Edit to build or fix UI/code files, or Bash to test/run the server (e.g. php -S localhost:8000 or npm run dev). ` +
-          `Do NOT re-read: [${Array.from(readFiles).join(", ")}, project_memory.md].`;
+          `${specHint}STOP listing directories! Now execute the user's request ("${latestUserPrompt}") inside "${targetRoot || targetProjectName}": ` +
+          `1) If project code files (index.php / index.html / CSS / JS / backend) are missing or need UI updates, create/update them NOW using Write/Edit in parallel. ` +
+          `2) Also run/verify the app using Bash (e.g. "php -l" or starting/checking local server).`;
         toolChoiceMode = "required";
-      } else if (modifiedFiles.size > 0 && !memoryUpdatedThisTurn) {
+      } else if (filesCreatedOrEditedThisTurn > 0 && !memoryUpdatedThisTurn) {
         stepInstruction =
-          `Update "${memoryFilePath}" using Write or Edit to log completed changes (${Array.from(modifiedFiles).slice(-4).join(", ")}) and remaining pending tasks.`;
+          `Files created/updated (${Array.from(modifiedFiles).slice(-5).join(", ")}). Now update "${memoryFilePath}" using Write/Edit with completed tasks and remaining pending tasks.`;
         toolChoiceMode = "required";
       } else {
         stepInstruction =
-          `Summarize clearly in 2-3 lines what files were created/updated, what was run/verified in "${targetProjectName}", and any local URL if started.`;
+          `Give a concise summary of all files created/updated in "${targetProjectName}", how to open/run the UI, and what is pending next.`;
         toolChoiceMode = "auto";
       }
 
-      // 8. Compact Messages Payload (~550-650 tokens)
+      // 8. Compact Messages Payload (~650 tokens)
       const groqMessages = [
         {
           role: "system",
           content:
-            `You are Claude Code working in project "${targetProjectName}" (Path: "${targetRoot || "."}"). ` +
-            `Work efficiently: execute multiple file operations in parallel, never repeat Read/ls commands, and always update PROJECT_MEMORY.md after edits.\n` +
+            `You are Claude Code building and running "${targetProjectName}" (Folder: "${targetRoot || "."}"). ` +
+            `Create complete, working files using Write/Edit in parallel and update PROJECT_MEMORY.md.\n` +
             stepInstruction,
         },
         {
           role: "user",
-          content: `CURRENT REQUEST: ${latestUserPrompt}`,
+          content: `REQUEST: ${latestUserPrompt}`,
         },
       ];
 
-      // Convert last 2 messages properly (preserving ALL parallel tool_uses and tool_results)
+      // Preserve last 2 messages with larger limit (2200 chars) so prompt.txt content isn't truncated
       const recentMsgs = allMsgs.slice(-2);
       for (const m of recentMsgs) {
         const mappedList = mapAnthropicToGroqMessages(m);
@@ -269,7 +283,7 @@ export default {
           type: "function",
           function: {
             name: "Write",
-            description: "Create or overwrite a file with complete code",
+            description: "Create or overwrite a file with full working code",
             parameters: {
               type: "object",
               properties: {
@@ -284,7 +298,7 @@ export default {
           type: "function",
           function: {
             name: "Edit",
-            description: "Replace exact string in an existing file",
+            description: "Replace exact text in an existing file",
             parameters: {
               type: "object",
               properties: {
@@ -312,7 +326,7 @@ export default {
           type: "function",
           function: {
             name: "Bash",
-            description: "Run shell command (list files, start PHP/Node server, verify app)",
+            description: "Run shell command (start PHP/Node server, verify syntax, check app)",
             parameters: {
               type: "object",
               properties: { command: { type: "string" } },
@@ -330,7 +344,6 @@ export default {
 
       let groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools, toolChoiceMode);
 
-      // Agar tool_choice: "required" par koi error aaye toh "auto" ke saath retry karein
       if (!groqRes.ok && toolChoiceMode === "required") {
         groqRes = await callGroq(apiKey, chosenModel, groqMessages, compactTools, "auto");
       }
@@ -450,7 +463,7 @@ async function callGroq(apiKey, model, messages, tools, toolChoice = "auto") {
       tools,
       tool_choice: toolChoice,
       parallel_tool_calls: true,
-      max_tokens: 2048,
+      max_tokens: 3000,
       temperature: 0.1,
     }),
   });
@@ -465,18 +478,16 @@ function extractText(content) {
   return "";
 }
 
-// Properly maps ALL parallel tool_uses and tool_results (prevents 400 mismatch errors)
 function mapAnthropicToGroqMessages(msg) {
   const role = msg.role === "assistant" ? "assistant" : "user";
   const content = msg.content;
 
   if (typeof content === "string") {
     const clean = content.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
-    return clean ? [{ role, content: clean.slice(-1100) }] : [];
+    return clean ? [{ role, content: clean.slice(-1500) }] : [];
   }
 
   if (Array.isArray(content)) {
-    // 1. Handle multiple tool_result blocks from user message
     const toolResults = content.filter((c) => c.type === "tool_result");
     if (toolResults.length > 0) {
       return toolResults.map((tr) => {
@@ -484,12 +495,11 @@ function mapAnthropicToGroqMessages(msg) {
         return {
           role: "tool",
           tool_call_id: tr.tool_use_id || "call_1",
-          content: out.slice(0, 1200),
+          content: out.slice(0, 2200),
         };
       });
     }
 
-    // 2. Handle multiple parallel tool_use blocks from assistant message
     const toolUses = content.filter((c) => c.type === "tool_use");
     if (toolUses.length > 0 && role === "assistant") {
       return [
@@ -508,13 +518,12 @@ function mapAnthropicToGroqMessages(msg) {
       ];
     }
 
-    // 3. Normal text blocks
     const text = content
       .filter((c) => c.type === "text" && c.text)
       .map((c) => c.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim())
       .filter(Boolean)
       .join("\n")
-      .slice(-1100);
+      .slice(-1500);
 
     return text ? [{ role, content: text }] : [];
   }
@@ -563,7 +572,7 @@ function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
         content: [],
         model,
         stop_reason: null,
-        usage: { input_tokens: 550, output_tokens: 1 },
+        usage: { input_tokens: 650, output_tokens: 1 },
       },
     })}\n\n`;
 
@@ -604,7 +613,7 @@ function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
     sse += `event: message_delta\ndata: ${JSON.stringify({
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: 200 },
+      usage: { output_tokens: 250 },
     })}\n\n`;
     sse += `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
 
@@ -624,7 +633,7 @@ function buildAnthropicReply({ text, toolCalls = [] }, isStream, modelName) {
     model,
     content: contentBlocks,
     stop_reason: stopReason,
-    usage: { input_tokens: 550, output_tokens: 200 },
+    usage: { input_tokens: 650, output_tokens: 250 },
   });
 }
 
